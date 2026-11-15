@@ -1,0 +1,85 @@
+{
+ "cues": 165,
+ "timed_words": 2065,
+ "errors": 0,
+ "first_errors": [],
+ "cue_dur_median": 3.22,
+ "cue_dur_max": 12.86
+}
+OK    710.73- 711.07 ardent             heard: right and ardent spirit.
+OK    281.61- 281.93 fluttered          heard: She fluttered out the
+OK    403.93- 404.27 tremendous         heard: Always a tremendous task.
+OK    753.01- 753.47 manger.            heard: tape in the manger.
+OK    606.43- 606.89 answer.            heard: You have the wrong answer.
+OK     51.63-  51.79 would              heard: This day would be Christmas.
+OK    517.99- 518.25 through            heard: and have lived through Christmas with us.
+OK    276.11- 276.41 brown              heard: her old brown hat.
+OK    750.51- 751.49 men—who            heard: wise men who brought gifts.
+OK     75.65-  75.93 furnished          heard: A furnished flat.
+OK    183.25- 183.51 glass              heard: Being a pure glass in an eight-day.
+OK    134.91- 135.17 cheeks             heard: into her cheeks with the pocket.
+OK    417.81- 418.25 reflection         heard: and looked at her reflection in the
+OK    519.49- 519.81 present.           heard: giving you a present.
+OK    271.19- 271.69 carpet.            heard: red carpet.
+OK    428.51- 428.71 Coney              heard: Click the Coney Island.
+OK    624.73- 624.77 “about             heard: about me
+OK    125.05- 125.49 hugged             heard: and greatly hugged by missing
+OK    652.87- 653.31 powers             heard: the comforting powers of the
+OK     38.27-  38.93 until              heard: the butcher until once.
+OK    242.05- 242.35 piled              heard: This treasure is piled up in the bay.
+OK    457.15- 457.37 moment.            heard: just a moment
+OK    312.13- 312.53 rippled            heard: Down, rippled the brown.
+OK    206.43- 206.71 color              heard: lost its color within 20 seconds.
+MISS  437.89- 438.17 coffee             heard: Clock the copy was made.
+OK    187.69- 188.01 observing          heard: by observing his reflection.
+OK     95.29-  95.93 appertaining       heard: Also, appertaining there on
+OK    163.55- 163.79 present            heard: to buy a present for Jim.
+OK    707.77- 708.15 metal              heard: All precious metal seem to
+OK    492.15- 492.29 could              heard: that she could not read.
+OK    149.81- 150.07 saving             heard: She had been saving everything.
+OK    154.27- 154.67 Twenty             heard: $20.
+MISS   24.99-  25.43 dollar             heard: $1 an
+OK     29.85-  30.19 cents              heard: and 60 cents of it was
+OK    235.69- 236.45 depreciate         heard: Just to depreciate her magic.
+OK    241.71- 242.05 treasures          heard: All his treasures piled up.
+OK    191.45- 192.23 obtain             heard: strips obtain a fairly.
+OK    192.45- 192.73 fairly             heard: Obtain a fairly accurate
+MISS  323.53- 323.75 hours              heard: next to our trip.
+OK    349.43- 349.87 alone              heard: substance alone.
+OK    223.97- 224.81 grandfather’s.     heard: and his grandfathers.
+OK    618.77- 619.19 pocket             heard: overcoat pocket and through it.
+OK    779.49- 779.75 these              heard: Wise of these days.
+MISS  714.07- 714.37 hunted             heard: I handed all of her.
+OK    229.71- 230.03 across             heard: in the flat across the air.
+OK    221.43- 221.85 watch              heard: I'm Scold Watch.
+OK    430.93- 431.09 could              heard: But what could I do?
+OK    331.75- 332.03 found              heard: She found it at last
+OK     45.37-  45.71 Three              heard: Three times.
+OK    405.95- 406.33 mammoth            heard: in mammoth taps.
+OK    461.31- 461.63 simplest           heard: about the simplest every day.
+OK    174.07- 174.25 little             heard: in just a little bit near.
+OK    293.17- 293.31 Della              heard: It up Della ran.
+OK     88.79-  89.01 would              heard: no letter would go
+OK    377.43- 377.83 properly           heard: might be properly anxious.
+OK    337.05- 337.33 other              heard: There is no other like it.
+OK    683.39- 684.15 adornments         heard: The coveted adornments were gone.
+OK    666.69- 667.97 rims—just          heard: Jeweled rims Just the shade
+MISS   26.65-  27.15 cents.             heard: $0.07.
+OK    676.63- 676.91 without            heard: over them without the least.
+WORDS: 55/60 sampled words heard inside their clip +/-0.50s
+OK   cue start  430.47  But what could               heard: But what could I do?
+MISS cue start   84.49  In the vestibule             heard: quad, and the best of...
+OK   cue start  381.37  Grand as the                 heard: Grand as the watch was
+MISS cue start  444.61  Della doubled the            heard: Late. Delta double.
+OK   cue start  374.57  With that chain              heard: With that chain on his watch
+OK   cue start  583.11  Shall I put                  heard: you. Shall I put the
+MISS cue start  390.01  When Della reached           heard: Wendella reached home.
+MISS cue start  238.11  Had King Solomon             heard: gifts.
+OK   cue start  570.61  It’s Christmas Eve,          heard: It's Christmas Eve.
+OK   cue start  225.35  The other was                heard: The other was Dela's hair.
+OK   cue start   75.43  A furnished flat             heard: A furnished flat at $8.
+OK   cue start  319.81  “Give it to                  heard: Give it to me quick sit down
+MISS cue start   28.47  And sixty cents              heard: All in 60.
+OK   cue start  451.99  Then she heard               heard: Then she heard a step on the stairs.
+OK   cue start  514.85  I had my                     heard: I had my hair cut off and
+SENTENCE STARTS: 10/15 cue first-words heard in [t0-0.3s, t0+1.5s]

@@ -1,0 +1,42 @@
+From 3fc0a8537c3a14dda6da4959602a7508fd03c7a3 Mon Sep 17 00:00:00 2001
+From: Grok Bot <bot@localhost>
+Date: Sun, 15 Nov 2026 20:47:21 +0000
+Subject: [PATCH 4/4] docs: where read-along sidecars are looked up and stored
+
+---
+ docs/READALONG_SIDECAR.md | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/docs/READALONG_SIDECAR.md b/docs/READALONG_SIDECAR.md
+index 40aeb3f..a24a765 100644
+--- a/docs/READALONG_SIDECAR.md
++++ b/docs/READALONG_SIDECAR.md
+@@ -72,6 +72,25 @@ Global time to track: the track with the largest `offset <= t0`; local time = `t
+ * Tap text → audio: select text and use **Play aligned from here**; the cue
+   is matched by block path then sentence text.
+ 
++## Where the plugin looks for it
++
++1. `Book.readalong.json` (or `Book.epub.readalong.json`) next to the EPUB.
++2. A sidecar stored **with the audiobook on Audiobookshelf**: any file named
++   `*.readalong.json` in the ABS item's folder. ABS lists it among the item's
++   library files (type "metadata"; ABS only parses `metadata.json`, so it is
++   left alone). When the plugin downloads that item from the ABS browser it
++   also fetches the sidecar to `abs_cache/<item id>/readalong.json` and writes
++   `readalong.meta` (item id, EPUB file name, title, sha1). Opening an EPUB
++   then matches it by EPUB file name, else by title, and the sidecar's
++   `abs_item_id` defaults to that item. Needs the ABS user's download
++   permission (same as the audio).
++
++Getting it onto the server: `make_readalong_sidecar.py --abs-folder <item
++folder> [--abs-scan]` or `publish_sidecar.py` (copies into the folder, asks ABS
++to rescan the item with an admin token). Grimmory/Booklore can hold it as a
++supplementary file (`--grimmory-book-id`), but the plugin does not fetch from
++Grimmory; copy it next to the EPUB from there.
++
+ ## Generating one
+ 
+ See `make_readalong_sidecar.py` (faster-whisper word timestamps, CUDA when
+-- 
+2.47.3
+

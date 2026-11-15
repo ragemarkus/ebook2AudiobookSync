@@ -1,0 +1,409 @@
+From c01e7020d6d2d818535459f3afaecb5bb6678f81 Mon Sep 17 00:00:00 2001
+From: Grok Bot <bot@localhost>
+Date: Sun, 15 Nov 2026 15:56:02 +0000
+Subject: [PATCH 1/4] Add optional Cloudflare Access service-token headers for
+ Audiobookshelf
+
+---
+ CF-ACCESS-PATCH.md     |  23 ++++++
+ abs_access.example.lua |   9 +++
+ absbrowse.lua          | 114 +++++++++++++++++++++++++++++
+ absclient.lua          | 159 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 305 insertions(+)
+ create mode 100644 CF-ACCESS-PATCH.md
+ create mode 100644 abs_access.example.lua
+
+diff --git a/CF-ACCESS-PATCH.md b/CF-ACCESS-PATCH.md
+new file mode 100644
+index 0000000..63aada5
+--- /dev/null
++++ b/CF-ACCESS-PATCH.md
+@@ -0,0 +1,23 @@
++# Cloudflare Access patch (local fork)
++
++This is an unofficial patch of **Audiobook Read-Along for KOReader** v0.6.13
++by stradichenko — https://github.com/stradichenko/audiobook.koplugin
++(GNU AGPL-3.0; see LICENSE). All credit for the plugin goes to the original author.
++
++What the patch changes (only `absclient.lua`, `absbrowse.lua`, plus the new `abs_access.example.lua`):
++
++* Every Audiobookshelf request (API calls, login, progress sync, cover and audio
++  downloads) carries `CF-Access-Client-Id` and `CF-Access-Client-Secret`
++  when a Cloudflare Access service token is configured.
++* The headers go only to the configured Audiobookshelf host. On a redirect to a
++  different host, the Access headers and the ABS Bearer token are stripped.
++* A redirect to `*.cloudflareaccess.com` (the Access login page) is reported as a
++  clear error instead of being parsed as a server reply.
++* With a token set, socket.http does not auto-follow a second redirect.
++* New menu item: Tools > Audiobook Read-Along > Audiobookshelf > Cloudflare Access,
++  with Save & test (GET /ping through Access) and Clear.
++* Fallback config file: `abs_access.lua` in the plugin folder.
++* If either value is blank, the plugin behaves exactly like upstream.
++
++Note: "Check for updates" in the plugin installs the upstream release and will
++remove this patch.
+diff --git a/abs_access.example.lua b/abs_access.example.lua
+new file mode 100644
+index 0000000..13135d6
+--- /dev/null
++++ b/abs_access.example.lua
+@@ -0,0 +1,9 @@
++-- [cf-access patch] Optional Cloudflare Access service token for Audiobookshelf.
++-- Copy to abs_access.lua (same folder) and fill in, OR set it from
++-- Tools > Audiobook Read-Along > Audiobookshelf > Cloudflare Access.
++-- Values set in the menu take priority over this file.
++-- Leave blank (or delete the file) if your server is not behind Cloudflare Access.
++return {
++    client_id = "",      -- e.g. "abcd1234....access"
++    client_secret = "",
++}
+diff --git a/absbrowse.lua b/absbrowse.lua
+index 9d9c58c..47f18aa 100644
+--- a/absbrowse.lua
++++ b/absbrowse.lua
+@@ -129,6 +129,26 @@ function ABSBrowse.buildMainMenu(plugin)
+         end,
+     })
+ 
++    -- ── [cf-access patch] Cloudflare Access service token ──
++    table.insert(menu, {
++        text_func = function()
++            local id = plugin:getSetting("abs_cf_access_client_id", "")
++            local secret = plugin:getSetting("abs_cf_access_client_secret", "")
++            if id ~= "" and secret ~= "" then
++                return _("Cloudflare Access: service token set")
++            end
++            local file_id = ABSClient and select(1, ABSClient.loadAccessCredentials()) or ""
++            if file_id ~= "" then
++                return _("Cloudflare Access: from abs_access.lua")
++            end
++            return _("Cloudflare Access: off")
++        end,
++        keep_menu_open = true,
++        callback = function(touchmenu_instance)
++            ABSBrowse._showAccessSettings(plugin, touchmenu_instance)
++        end,
++    })
++
+     -- ── Sync now ──
+     if is_logged_in and cache and cache:count() > 0 then
+         table.insert(menu, {
+@@ -280,6 +300,100 @@ function ABSBrowse._showServerSettings(plugin, touchmenu_instance)
+     UIManager:show(dialog)
+ end
+ 
++-- ---------------------------------------------------------------------------
++-- [cf-access patch] Cloudflare Access service-token dialog
++-- ---------------------------------------------------------------------------
++
++function ABSBrowse._showAccessSettings(plugin, touchmenu_instance)
++    local MultiInputDialog = require("ui/widget/multiinputdialog")
++    local pp = plugin.path and (plugin.path .. "/") or "./"
++    local ABSClient
++    pcall(function() ABSClient = dofile(pp .. "absclient.lua") end)
++
++    local function refresh()
++        if touchmenu_instance then touchmenu_instance:updateItems() end
++    end
++
++    local dialog
++    dialog = MultiInputDialog:new{
++        title = _("Cloudflare Access service token"),
++        description = _("Only needed when your Audiobookshelf URL is protected by Cloudflare Access. Leave both blank to turn this off. Values are sent only to the Audiobookshelf host."),
++        fields = {
++            {
++                text = plugin:getSetting("abs_cf_access_client_id", ""),
++                hint = _("CF-Access-Client-Id (ends in .access)"),
++            },
++            {
++                text = plugin:getSetting("abs_cf_access_client_secret", ""),
++                hint = _("CF-Access-Client-Secret"),
++                text_type = "password",
++            },
++        },
++        buttons = {
++            {
++                {
++                    text = _("Cancel"),
++                    id = "close",
++                    callback = function()
++                        UIManager:close(dialog)
++                    end,
++                },
++                {
++                    text = _("Clear"),
++                    callback = function()
++                        plugin:setSetting("abs_cf_access_client_id", "")
++                        plugin:setSetting("abs_cf_access_client_secret", "")
++                        UIManager:close(dialog)
++                        refresh()
++                        UIManager:show(InfoMessage:new{
++                            text = _("Cloudflare Access token cleared."),
++                            timeout = 2,
++                        })
++                    end,
++                },
++            },
++            {
++                {
++                    text = _("Save & test"),
++                    is_enter_default = true,
++                    callback = function()
++                        local fields = dialog:getFields()
++                        local id = (fields[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
++                        local secret = (fields[2] or ""):gsub("^%s+", ""):gsub("%s+$", "")
++                        plugin:setSetting("abs_cf_access_client_id", id)
++                        plugin:setSetting("abs_cf_access_client_secret", secret)
++                        UIManager:close(dialog)
++                        refresh()
++                        local server_url = plugin:getSetting("abs_server_url", "")
++                        if not ABSClient or server_url == "" then
++                            UIManager:show(InfoMessage:new{
++                                text = _("Saved. Set the server URL to test the connection."),
++                                timeout = 3,
++                            })
++                            return
++                        end
++                        UIManager:show(InfoMessage:new{
++                            text = _("Testing connection…"),
++                            timeout = 1,
++                        })
++                        UIManager:scheduleIn(0.3, function()
++                            local client = ABSClient:new{ server_url = server_url }
++                            local ok, err = client:pingServer()
++                            UIManager:show(InfoMessage:new{
++                                text = ok and _("Saved. Audiobookshelf is reachable through Cloudflare Access.")
++                                    or (_("Saved, but the test failed: ") .. tostring(err)),
++                                timeout = ok and 3 or 6,
++                            })
++                        end)
++                    end,
++                },
++            },
++        },
++    }
++    UIManager:show(dialog)
++    dialog:onShowKeyboard()
++end
++
+ -- ---------------------------------------------------------------------------
+ -- Login dialog
+ -- ---------------------------------------------------------------------------
+diff --git a/absclient.lua b/absclient.lua
+index ab1561d..20680e8 100644
+--- a/absclient.lua
++++ b/absclient.lua
+@@ -24,9 +24,148 @@ function ABSClient:new(o)
+     o.token = o.token or ""
+     o.user_id = o.user_id or ""
+ 
++    -- [cf-access patch] Cloudflare Access service-token credentials.
++    -- Callers may pass cf_access_client_id / cf_access_client_secret; if they
++    -- don't, fall back to the plugin settings, then to abs_access.lua.
++    if o.cf_access_client_id == nil or o.cf_access_client_secret == nil then
++        local id, secret = ABSClient.loadAccessCredentials()
++        if o.cf_access_client_id == nil then o.cf_access_client_id = id end
++        if o.cf_access_client_secret == nil then o.cf_access_client_secret = secret end
++    end
++    o.cf_access_client_id = ABSClient._trim(o.cf_access_client_id)
++    o.cf_access_client_secret = ABSClient._trim(o.cf_access_client_secret)
++
+     return o
+ end
+ 
++-- ---------------------------------------------------------------------------
++-- [cf-access patch] Cloudflare Access service-token support
++-- ---------------------------------------------------------------------------
++-- When an Audiobookshelf server sits behind Cloudflare Access, every request
++-- must carry CF-Access-Client-Id / CF-Access-Client-Secret. These are optional:
++-- when either value is blank the client behaves exactly like upstream.
++
++ABSClient.ACCESS_SETTINGS_KEY = "audiobook_settings"
++ABSClient.ACCESS_ID_KEY = "abs_cf_access_client_id"
++ABSClient.ACCESS_SECRET_KEY = "abs_cf_access_client_secret"
++ABSClient.ACCESS_CONFIG_FILE = "abs_access.lua"
++
++function ABSClient._trim(v)
++    if type(v) ~= "string" then return "" end
++    return (v:gsub("^%s+", ""):gsub("%s+$", ""))
++end
++
++local function plugin_dir()
++    local src = debug.getinfo(1, "S").source or ""
++    return src:match("^@(.*/)") or "./"
++end
++
++--[[--
++Find Access credentials. Order: KOReader settings (set from the plugin menu),
++then <plugin dir>/abs_access.lua returning
++{ client_id = "...", client_secret = "..." }.
++@return string, string  client_id, client_secret ("" when not configured)
++--]]
++function ABSClient.loadAccessCredentials()
++    local id, secret = "", ""
++    if G_reader_settings and G_reader_settings.readSetting then
++        local ok, settings = pcall(function()
++            return G_reader_settings:readSetting(ABSClient.ACCESS_SETTINGS_KEY)
++        end)
++        if ok and type(settings) == "table" then
++            id = ABSClient._trim(settings[ABSClient.ACCESS_ID_KEY])
++            secret = ABSClient._trim(settings[ABSClient.ACCESS_SECRET_KEY])
++        end
++    end
++    if id == "" or secret == "" then
++        local path = plugin_dir() .. ABSClient.ACCESS_CONFIG_FILE
++        local f = io.open(path, "r")
++        if f then
++            f:close()
++            local ok, cfg = pcall(dofile, path)
++            if ok and type(cfg) == "table" then
++                id = ABSClient._trim(cfg.client_id)
++                secret = ABSClient._trim(cfg.client_secret)
++            else
++                logger.warn("ABSClient: could not read", path, tostring(cfg))
++            end
++        end
++    end
++    return id, secret
++end
++
++-- [cf-access patch] nil = socket.http default (auto-follow, upstream
++-- behaviour); false = don't auto-follow when an Access token is set.
++function ABSClient:_followRedirectFlag()
++    if self:hasAccessCredentials() then return false end
++    return nil
++end
++
++function ABSClient:hasAccessCredentials()
++    return self.cf_access_client_id ~= "" and self.cf_access_client_secret ~= ""
++end
++
++local function url_host(url)
++    if type(url) ~= "string" then return nil end
++    local host = url:match("^%a[%w+.-]*://([^/?#]+)")
++    if not host then return nil end
++    host = host:gsub("^.*@", "")       -- drop userinfo
++    host = host:gsub(":%d+$", "")      -- drop port
++    return host:lower()
++end
++ABSClient._urlHost = url_host
++
++--[[--
++Add the Access headers to `headers` when credentials are configured and
++`url` points at the configured ABS host (never leak them to other hosts).
++--]]
++function ABSClient:_applyAccessHeaders(headers, url)
++    headers["CF-Access-Client-Id"] = nil
++    headers["CF-Access-Client-Secret"] = nil
++    if not self:hasAccessCredentials() then return headers end
++    local target = url_host(url)
++    if target and target == url_host(self.server_url) then
++        headers["CF-Access-Client-Id"] = self.cf_access_client_id
++        headers["CF-Access-Client-Secret"] = self.cf_access_client_secret
++    end
++    return headers
++end
++
++--[[--
++Inspect a redirect target before following it.
++@return string|nil  error message when the redirect must not be followed
++--]]
++function ABSClient:_checkRedirect(location, headers)
++    local host = url_host(location)
++    if host and host:match("cloudflareaccess%.com$") then
++        if self:hasAccessCredentials() then
++            return _("Blocked by Cloudflare Access: the service token was rejected. Check the Access Client ID/Secret and that the token is allowed on this application.")
++        end
++        return _("This server is behind Cloudflare Access. Set an Access service token under Audiobookshelf > Cloudflare Access.")
++    end
++    if host and host ~= url_host(self.server_url) then
++        -- Cross-host redirect: do not forward credentials.
++        headers["Authorization"] = nil
++        headers["CF-Access-Client-Id"] = nil
++        headers["CF-Access-Client-Secret"] = nil
++    end
++    return nil
++end
++
++--[[--
++Quick connectivity check that works without an ABS login: GET /ping
++(unauthenticated in ABS, but still gated by Cloudflare Access).
++@return boolean, string|nil
++--]]
++function ABSClient:pingServer()
++    local data, err = self:_request("/ping")
++    if not data then return false, err end
++    if type(data) == "table" and (data.success == true or data.raw) then
++        return true, nil
++    end
++    return false, _("Unexpected response from /ping.")
++end
++
+ -- ---------------------------------------------------------------------------
+ -- Internal: generic authenticated request
+ -- ---------------------------------------------------------------------------
+@@ -61,6 +200,7 @@ function ABSClient:_request(endpoint, method, body)
+     if self.token and self.token ~= "" then
+         headers["Authorization"] = "Bearer " .. self.token
+     end
++    self:_applyAccessHeaders(headers, url)  -- [cf-access patch]
+ 
+     local request_body = nil
+     if body then
+@@ -103,6 +243,12 @@ function ABSClient:_request(endpoint, method, body)
+             local base = self.server_url:match("^(https?://.+/)") or (self.server_url .. "/")
+             redirect_url = base .. redirect_url
+         end
++        -- [cf-access patch] refuse Access login redirects; scope headers to ABS host
++        local access_err = self:_checkRedirect(redirect_url, headers)
++        if access_err then
++            return nil, access_err
++        end
++        self:_applyAccessHeaders(headers, redirect_url)
+ 
+         sink = {}
+         socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_BLOCK_TIMEOUT)
+@@ -112,6 +258,9 @@ function ABSClient:_request(endpoint, method, body)
+             headers = headers,
+             source = request_body and ltn12.source.string(request_body) or nil,
+             sink = ltn12.sink.table(sink),
++            -- [cf-access patch] don't let socket.http auto-follow (and re-send
++            -- the Access secret) on a second redirect when a token is set
++            redirect = self:_followRedirectFlag(),
+         })
+         socketutil:reset_timeout()
+     end
+@@ -390,6 +539,7 @@ function ABSClient:downloadFile(url, dest_path)
+     if self.token and self.token ~= "" then
+         headers["Authorization"] = "Bearer " .. self.token
+     end
++    self:_applyAccessHeaders(headers, url)  -- [cf-access patch]
+ 
+     -- Ensure parent directory exists
+     local dir = dest_path:match("^(.*)/[^/]*$")
+@@ -429,6 +579,14 @@ function ABSClient:downloadFile(url, dest_path)
+             local base = self.server_url:match("^(https?://.+/)") or (self.server_url .. "/")
+             redirect_url = base .. redirect_url
+         end
++        -- [cf-access patch] refuse Access login redirects; scope headers to ABS host
++        local access_err = self:_checkRedirect(redirect_url, headers)
++        if access_err then
++            socketutil:reset_timeout()
++            os.remove(dest_path)
++            return false, access_err
++        end
++        self:_applyAccessHeaders(headers, redirect_url)
+         f, ferr = io.open(dest_path, "wb")
+         if not f then
+             socketutil:reset_timeout()
+@@ -440,6 +598,7 @@ function ABSClient:downloadFile(url, dest_path)
+             method = "GET",
+             headers = headers,
+             sink = ltn12.sink.file(f),
++            redirect = self:_followRedirectFlag(),  -- [cf-access patch]
+         })
+     end
+ 
+-- 
+2.47.3
+

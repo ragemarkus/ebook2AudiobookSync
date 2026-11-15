@@ -1,0 +1,28 @@
+# build output and the ~180 MB upstream release zip
+build/
+*.zip
+# audio, books, models (never commit)
+*.mp3
+*.m4a
+*.m4b
+*.mp4
+*.ogg
+*.opus
+*.flac
+*.wav
+*.aac
+*.epub
+books/
+models/
+sidecar/books/
+sidecar/models/
+.transcripts/
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+# local secrets
+abs_access.lua
+.env
+*.secret

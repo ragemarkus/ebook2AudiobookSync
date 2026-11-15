@@ -1,0 +1,6 @@
+faster-whisper>=1.1
+lxml>=5
+numpy
+# GPU on Windows/Linux without a system CUDA toolkit (ctranslate2 4.x needs CUDA 12 + cuDNN 9):
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12==9.*

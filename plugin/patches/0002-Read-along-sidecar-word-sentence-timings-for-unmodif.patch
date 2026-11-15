@@ -1,0 +1,1337 @@
+From e7266e0764677bd51e8f2634b5a251a7f22c9d8f Mon Sep 17 00:00:00 2001
+From: Grok Bot <bot@localhost>
+Date: Sun, 15 Nov 2026 20:37:50 +0000
+Subject: [PATCH 2/4] Read-along sidecar: word/sentence timings for unmodified
+ EPUBs with Audiobookshelf audio
+
+Adds readalongsidecar.lua (book.readalong.json next to the EPUB), wired into
+the overlay loader ahead of EPUB Media Overlays; xpointer-based highlight and
+page follow for ra:<n> cues; per-word boxes; ABS position sync with global
+track offsets and an ABS resume offer. Tests in dev/test_readalong_sidecar*.lua.
+---
+ dev/fake_crengine_doc.lua                |  70 ++++
+ dev/test_readalong_sidecar.lua           | 152 ++++++++
+ dev/test_readalong_sidecar_highlight.lua | 101 +++++
+ docs/READALONG_SIDECAR.md                |  80 ++++
+ highlightmanager.lua                     |  79 ++++
+ main.lua                                 | 155 +++++++-
+ mediasync.lua                            |  26 ++
+ package-for-kobo.sh                      |   2 +-
+ readalongsidecar.lua                     | 445 +++++++++++++++++++++++
+ 9 files changed, 1100 insertions(+), 10 deletions(-)
+ create mode 100644 dev/fake_crengine_doc.lua
+ create mode 100644 dev/test_readalong_sidecar.lua
+ create mode 100644 dev/test_readalong_sidecar_highlight.lua
+ create mode 100644 docs/READALONG_SIDECAR.md
+ create mode 100644 readalongsidecar.lua
+
+diff --git a/dev/fake_crengine_doc.lua b/dev/fake_crengine_doc.lua
+new file mode 100644
+index 0000000..712b295
+--- /dev/null
++++ b/dev/fake_crengine_doc.lua
+@@ -0,0 +1,70 @@
++-- Minimal stand-in for a crengine document (rolling mode) used by the
++-- read-along sidecar tests: paragraphs of text addressed by
++-- "<base>/p[N]/text().OFFSET" xpointers.
++-- Paragraph texts as crengine would hold them; offsets are 0-based.
++local function FakeDoc(paras, base)
++    local words = {}  -- ordered { p=, s=, e= }
++    for pi, txt in ipairs(paras) do
++        for s, w in txt:gmatch("()(%S+)") do words[#words + 1] = { p = pi, s = s - 1, e = s - 1 + #w } end
++    end
++    local function px(pi) return base .. "/p[" .. pi .. "]" end
++    local function xp(pi, off) return px(pi) .. "/text()." .. off end
++    local function parse(x)
++        local pi, off = x:match("/p%[(%d+)%]/text%(%)%.(%d+)$")
++        if pi then return tonumber(pi), tonumber(off) end
++        pi = x:match("/p%[(%d+)%]$")
++        if pi then return tonumber(pi), nil end
++    end
++    local d = {}
++    function d:getNormalizedXPointer(x)
++        local pi, off = parse(x)
++        if not pi or not paras[pi] then return false end
++        if off and off > #paras[pi] then return false end
++        return x
++    end
++    local function word_idx_at_or_after(pi, off)
++        for i, w in ipairs(words) do
++            if w.p > pi or (w.p == pi and w.e > (off or -1)) then return i end
++        end
++    end
++    function d:getNextVisibleWordStart(x)
++        local pi, off = parse(x)
++        if not off then local i = word_idx_at_or_after(pi, -1) return i and xp(words[i].p, words[i].s) end
++        for i, w in ipairs(words) do
++            if w.p > pi or (w.p == pi and w.s > off) then return xp(w.p, w.s) end
++        end
++    end
++    function d:getNextVisibleWordEnd(x)
++        local pi, off = parse(x)
++        for i, w in ipairs(words) do
++            if w.p > pi or (w.p == pi and w.e > (off or -1)) then return xp(w.p, w.e) end
++        end
++    end
++    function d:getTextFromXPointers(a, b)
++        local p0, o0 = parse(a); local p1, o1 = parse(b)
++        o0 = o0 or 0
++        if p0 == p1 then return paras[p0]:sub(o0 + 1, o1) end
++        local out = { paras[p0]:sub(o0 + 1) }
++        for k = p0 + 1, p1 - 1 do out[#out + 1] = paras[k] end
++        out[#out + 1] = paras[p1]:sub(1, o1)
++        return table.concat(out, " ")
++    end
++    local function key(x)
++        local pi, off = parse(x)
++        return pi * 100000 + (off or -1)
++    end
++    function d:compareXPointers(a, b)
++        local ka, kb = key(a), key(b)
++        if ka == kb then return 0 end
++        return ka < kb and 1 or -1
++    end
++    function d:getPrevVisibleWordEnd(x)
++        local k, best = key(x), nil
++        for _, w in ipairs(words) do
++            if w.p * 100000 + w.e < k then best = xp(w.p, w.e) end
++        end
++        return best
++    end
++    return d
++end
++return FakeDoc
+diff --git a/dev/test_readalong_sidecar.lua b/dev/test_readalong_sidecar.lua
+new file mode 100644
+index 0000000..ce83a0e
+--- /dev/null
++++ b/dev/test_readalong_sidecar.lua
+@@ -0,0 +1,152 @@
++#!/usr/bin/env luajit
++-- Tests for readalongsidecar.lua (sidecar read-along for unmodified EPUBs).
++-- Run from the repo root: luajit dev/test_readalong_sidecar.lua [DEMO_DIR]
++-- DEMO_DIR (optional): folder with "The Gift of the Magi.epub", its
++-- .readalong.json and magi.mp3 -- runs the end-to-end load as well.
++
++local here = (arg and arg[0]):gsub("[^/]+$", "")
++package.preload["logger"] = function()
++    return setmetatable({}, { __index = function() return function() end end })
++end
++package.preload["audiobook_gettext"] = function() return function(s) return s end end
++local Sidecar = dofile(here .. "../readalongsidecar.lua")
++local Utils = dofile(here .. "../utils.lua")
++
++local failures, checks = {}, 0
++local function ok(c, label) checks = checks + 1 if not c then failures[#failures + 1] = label end end
++local function eq(a, b, label) ok(a == b, string.format("%s: expected %s, got %s", label, tostring(b), tostring(a))) end
++local function near(a, b, label) ok(a and math.abs(a - b) < 1e-6, string.format("%s: expected %s, got %s", label, tostring(b), tostring(a))) end
++
++-- ── JSON fallback decoder ────────────────────────────────────────────────
++local j = Sidecar.decodeJson('{"a":[1,2.5,-3e2,"x\\u2019y\\n"],"b":{"c":true,"d":null},"e":[]}')
++eq(j.a[2], 2.5, "json float"); eq(j.a[3], -300, "json exp"); eq(j.a[4], "x\226\128\153y\n", "json unicode escape")
++eq(j.b.c, true, "json bool"); eq(#j.e, 0, "json empty array")
++
++-- ── buildTimingData: two tracks, global -> track-local ───────────────────
++local sc = {
++    format = "koreader-readalong", version = 1,
++    book = { spine = { "cover.xhtml", "ch1.xhtml", "ch2.xhtml" } },
++    audio = { abs_item_id = "li_123", duration = 200,
++        tracks = { { index = 1, file = "01.mp3", duration = 100, offset = 0 },
++                   { index = 2, file = "02.mp3", duration = 100, offset = 100 } } },
++    cue_fields = { "t0", "t1", "spine", "xp", "bxp", "bw", "text", "words" },
++    cues = {
++        { 10.0, 12.5, 2, "/body/DocFragment[2]/body/div[1]/p[1]/text().0", "/body/DocFragment[2]/body/div[1]/p[1]", 0,
++          "Hello there world.", { { 0, 400, "Hello" }, { 500, 300, "there" }, { 900, 1000, "world." } } },
++        { 98.0, 101.0, 2, "/body/DocFragment[2]/body/div[1]/p[2]/text().0", "/body/DocFragment[2]/body/div[1]/p[2]", 0,
++          "Across the boundary.", {} },
++        { 150.0, 152.0, 3, "/body/DocFragment[3]/body/p[3]/text().5", "/body/DocFragment[3]/body/p[3]", 1,
++          "Second track.", { { 0, 500, "Second" } } },
++    },
++}
++local p = Sidecar:new()
++local td = p:buildTimingData(sc, { "/a/01.mp3", "/a/02.mp3" })
++eq(#td, 3, "entries")
++eq(td[1].audio_path, "/a/01.mp3", "cue1 track"); near(td[1].start_time, 10.0, "cue1 local start")
++eq(td[2].audio_path, "/a/01.mp3", "boundary cue stays on starting track")
++near(td[2].end_time, 100.0, "boundary cue clamped to track end")
++eq(td[3].audio_path, "/a/02.mp3", "cue3 track 2"); near(td[3].start_time, 50.0, "cue3 local start")
++near(td[3].global_start, 150.0, "cue3 global start")
++eq(td[1].fragment_id, "ra:1", "fragment id"); eq(td[3].text_doc, "ch2.xhtml", "text_doc from spine index")
++eq(td[1].elem_path, "body/div/p", "elem_path normalised like CRe tap paths")
++eq(td[3].elem_path, "body/p[3]", "elem_path keeps non-first index")
++near(td[1].words[2].start_time, 10.5, "word local start"); near(td[1].words[3].end_time, 11.9, "word local end")
++eq(td[2].words, nil, "empty words -> nil")
++eq(p.abs_item_id, "li_123", "abs item id")
++near(p:globalPosition("/a/02.mp3", 7), 107, "global position track 2")
++eq(p:entryAtGlobalTime(99).fragment_id, "ra:2", "entryAtGlobalTime mid")
++eq(p:entryAtGlobalTime(5).fragment_id, "ra:1", "entryAtGlobalTime before first")
++eq(p:entryAtGlobalTime(500).fragment_id, "ra:3", "entryAtGlobalTime after last")
++eq(p._spine_hrefs[2], "ch1.xhtml", "spine hrefs for DocFragment mapping")
++ok(Sidecar.isSidecarFragment("ra:9") and not Sidecar.isSidecarFragment("id12-s0"), "isSidecarFragment")
++-- the overlay machinery's e-ink cue grouping still works on these entries
++local groups = Utils.buildCueGroups(td, 0.5)
++ok(groups and #groups >= 1, "buildCueGroups accepts sidecar entries")
++
++-- ── audio resolution: ABS cache stub ─────────────────────────────────────
++local tmp = os.tmpname(); os.remove(tmp); os.execute("mkdir -p " .. tmp)
++for _, f in ipairs({ "c1.mp3", "c2.mp3" }) do local h = io.open(tmp .. "/" .. f, "w") h:write("x") h:close() end
++local stub = { getAudioPaths = function(_, id) if id == "li_123" then return { tmp .. "/c1.mp3", tmp .. "/c2.mp3" } end end }
++local q = Sidecar:new{ abs_cache = stub }
++local paths, how = q:_resolveAudio(sc, tmp .. "/Book.readalong.json", nil)
++eq(how, "abs", "audio from ABS cache"); eq(paths and paths[2], tmp .. "/c2.mp3", "ABS track order kept")
++local stub1 = { getAudioPaths = function() return { tmp .. "/c1.mp3" } end }
++local r, why = Sidecar:new{ abs_cache = stub1 }:_resolveAudio(sc, tmp .. "/B.readalong.json", nil)
++ok(r == nil and tostring(why):find("expects 2"), "track count mismatch is reported")
++local r2, why2 = Sidecar:new{ abs_cache = { getAudioPaths = function() return nil end } }:_resolveAudio(sc, tmp .. "/B.readalong.json", nil)
++ok(r2 == nil and tostring(why2):find("download this audiobook"), "not-downloaded is reported")
++for _, f in ipairs({ "01.mp3", "02.mp3" }) do local h = io.open(tmp .. "/" .. f, "w") h:write("x") h:close() end
++local paths3, how3 = Sidecar:new{ abs_cache = stub }:_resolveAudio(sc, tmp .. "/Book.readalong.json", nil)
++eq(how3, "local", "local track files next to the sidecar win")
++local h = io.open(tmp .. "/Book.readalong.json", "w") h:write("{}") h:close()
++eq(Sidecar.findSidecar(tmp .. "/Book.epub"), tmp .. "/Book.readalong.json", "findSidecar stem")
++eq(Sidecar.findSidecar(tmp .. "/Other.epub"), nil, "findSidecar none")
++local bad, berr = Sidecar.read(tmp .. "/Book.readalong.json")
++ok(bad == nil and berr, "read rejects non-sidecar JSON")
++os.execute("rm -rf " .. tmp)
++
++-- ── resolveStartXPointer against a fake crengine document ────────────────
++local FakeDoc = dofile(here .. "fake_crengine_doc.lua")
++local base = "/body/DocFragment[3]/body/div"
++local doc = FakeDoc({
++    "One dollar and eighty-seven cents. That was all.",
++    "The cat sat. The cat sat again. The dog ran.",
++}, base)
++local function entry(xp, bxp, bw, text) return { xpointer = xp, block_xpointer = bxp, block_word = bw, text = text } end
++eq(Sidecar.resolveStartXPointer(doc, entry(base .. "/p[1]/text().35", base .. "/p[1]", 5, "That was all.")),
++    base .. "/p[1]/text().35", "exact xpointer")
++-- crengine trimmed one leading char: generator offset is one too far
++eq(Sidecar.resolveStartXPointer(doc, entry(base .. "/p[1]/text().36", base .. "/p[1]", 5, "That was all.")),
++    base .. "/p[1]/text().35", "xpointer nudged by whitespace difference")
++-- unusable xpointer: block walk picks the occurrence nearest the word index
++eq(Sidecar.resolveStartXPointer(doc, entry(base .. "/p[9]/text().0", base .. "/p[2]", 3, "The cat sat again.")),
++    base .. "/p[2]/text().13", "block walk: second 'The cat sat' (bw=3)")
++-- the block's own start xpointer is a valid start for the first word
++local first = Sidecar.resolveStartXPointer(doc, entry(nil, base .. "/p[2]", 0, "The cat sat."))
++ok(first == base .. "/p[2]" or first == base .. "/p[2]/text().0", "block walk: first occurrence (bw=0)")
++eq(Sidecar.resolveStartXPointer(doc, entry(nil, base .. "/p[2]", 6, "The dog ran.")),
++    base .. "/p[2]/text().32", "block walk: later sentence")
++eq(Sidecar.resolveStartXPointer(doc, entry(nil, base .. "/p[2]", 0, "Nothing like this")), nil,
++    "no match -> nil (caller falls back to text matching)")
++-- the walk must not leave p[1] for p[10]
++local many = {}
++for i = 1, 10 do many[i] = "Para " .. i .. " text." end
++many[10] = "Target words here."
++local doc10 = FakeDoc(many, base)
++eq(Sidecar.resolveStartXPointer(doc10, entry(nil, base .. "/p[1]", 0, "Target words here.")), nil,
++    "block walk stays inside its block")
++eq(Sidecar.resolveStartXPointer(doc10, entry(nil, base .. "/p[10]", 0, "Target words here.")) ~= nil, true,
++    "block walk finds p[10]")
++-- resolveFragment caches per id
++local rp = Sidecar:new()
++rp._by_frag["ra:1"] = entry(base .. "/p[1]/text().0", base .. "/p[1]", 0, "One dollar and")
++eq(rp:resolveFragment(doc, "ra:1"), base .. "/p[1]/text().0", "resolveFragment")
++eq(rp._xp_cache["ra:1"], base .. "/p[1]/text().0", "resolveFragment caches")
++
++-- ── end to end on the prototype book (optional) ──────────────────────────
++local demo = arg and arg[1]
++if demo then
++    local epub = demo .. "/The Gift of the Magi.epub"
++    local sp = Sidecar:new()
++    local tdd, err = sp:loadFromEpub(epub, here .. "..")
++    ok(tdd ~= nil, "demo load: " .. tostring(err))
++    if tdd then
++        eq(sp.audio_source, "local", "demo audio next to the book")
++        local mono, words, with_xp = true, 0, 0
++        for i = 2, #tdd do if tdd[i].start_time < tdd[i - 1].start_time then mono = false end end
++        for _, e in ipairs(tdd) do
++            words = words + (e.words and #e.words or 0)
++            if e.xpointer and e.xpointer:match("^/body/DocFragment%[3%]") then with_xp = with_xp + 1 end
++        end
++        ok(mono, "demo cues monotonic")
++        print(string.format("demo: %d cues, %d timed words, %d xpointers in DocFragment[3], first=%q @%.2fs",
++            #tdd, words, with_xp, tdd[1].text:sub(1, 40), tdd[1].start_time))
++    end
++end
++
++if #failures > 0 then
++    print(string.format("FAIL %d/%d", #failures, checks))
++    for _, f in ipairs(failures) do print("  " .. f) end
++    os.exit(1)
++end
++print(string.format("ok %d checks", checks))
+diff --git a/dev/test_readalong_sidecar_highlight.lua b/dev/test_readalong_sidecar_highlight.lua
+new file mode 100644
+index 0000000..6d0e456
+--- /dev/null
++++ b/dev/test_readalong_sidecar_highlight.lua
+@@ -0,0 +1,101 @@
++#!/usr/bin/env luajit
++-- Integration: HighlightManager + read-along sidecar entries on a fake
++-- crengine document.  Checks that a sidecar cue ("ra:<n>", no ids in the
++-- EPUB) resolves to the right start xpointer and that the existing word-walk
++-- grows the range to exactly the cue's sentence, clamped before the next cue.
++-- Run from the repo root: luajit dev/test_readalong_sidecar_highlight.lua
++local here = (arg and arg[0]):gsub("[^/]+$", "")
++package.preload["logger"] = function()
++    return setmetatable({}, { __index = function() return function() end end })
++end
++package.preload["audiobook_gettext"] = function() return function(s) return s end end
++package.preload["ffi/blitbuffer"] = function() return {} end
++package.preload["device"] = function()
++    return { screen = { getWidth = function() return 1000 end, getHeight = function() return 1000 end },
++             isKindle = function() return false end }
++end
++package.preload["ui/geometry"] = function() return { new = function(_, o) return o end } end
++package.preload["ui/uimanager"] = function() return setmetatable({}, { __index = function() return function() end end }) end
++
++local Sidecar = dofile(here .. "../readalongsidecar.lua")
++local HM = dofile(here .. "../highlightmanager.lua")
++local FakeDoc = dofile(here .. "fake_crengine_doc.lua")
++
++local failures, checks = {}, 0
++local function eq(a, b, label)
++    checks = checks + 1
++    if a ~= b then failures[#failures + 1] = string.format("%s: expected %s, got %s", label, tostring(b), tostring(a)) end
++end
++
++local base = "/body/DocFragment[2]/body/div[1]"
++local paras = {
++    "One dollar and eighty-seven cents. That was all. And sixty cents of it was in pennies.",
++    "The cat sat. The cat sat again.",
++}
++-- crengine-side text has the same words; the generator's offsets are given
++-- one too high for paragraph 1 (as if crengine trimmed a leading space).
++local doc = FakeDoc(paras, "/body/DocFragment[2]/body/div")
++local sc = {
++    format = "koreader-readalong", version = 1,
++    book = { spine = { "cover.xhtml", "ch1.xhtml" } },
++    audio = { abs_item_id = "li_1", duration = 60, tracks = { { index = 1, file = "a.mp3", duration = 60, offset = 0 } } },
++    cues = {
++        { 1, 3, 2, base .. "/p[1]/text().1", base .. "/p[1]", 0, "One dollar and eighty-seven cents.", {} },
++        { 3, 4, 2, base .. "/p[1]/text().36", base .. "/p[1]", 5, "That was all.", {} },
++        { 4, 7, 2, base .. "/p[1]/text().50", base .. "/p[1]", 8, "And sixty cents of it was in pennies.", {} },
++        { 8, 9, 2, "/broken", base .. "/p[2]", 0, "The cat sat.", {} },
++        { 9, 11, 2, "/broken", base .. "/p[2]", 3, "The cat sat again.", {} },
++    },
++}
++-- generator writes explicit [1] indices; the fake doc addresses without them
++for _, c in ipairs(sc.cues) do
++    c[4] = c[4]:gsub("div%[1%]", "div"); c[5] = c[5]:gsub("div%[1%]", "div")
++end
++local parser = Sidecar:new()
++local td = parser:buildTimingData(sc, { "/x/a.mp3" })
++local plugin = { _smil_parser = parser, getSetting = function(_, _, d) return d end }
++local hm = HM:new{ plugin = plugin, ui = { document = doc, rolling = true } }
++plugin.media_sync = { timing_data = td, _current_sentence_idx = 1,
++    _getExpectedDocFragmentIndex = function() return 2 end }
++
++local function range_text(i)
++    local e = td[i]
++    local xp0, xp1 = hm:_fragmentTextRange(doc, e.fragment_id, e)
++    if not xp0 then return nil end
++    return doc:getTextFromXPointers(xp0, xp1)
++end
++for i, want in ipairs({ "One dollar and eighty-seven cents.", "That was all.",
++        "And sixty cents of it was in pennies.", "The cat sat.", "The cat sat again." }) do
++    plugin.media_sync._current_sentence_idx = i
++    eq(range_text(i), want, "cue " .. i .. " highlight range")
++end
++
++-- word highlight inside a sidecar cue: sidecar tokens "eighty" / "seven"
++-- both land on crengine's single word "eighty-seven"
++function doc:getScreenBoxesFromPositions(a, b) return { { x = 0, y = 0, w = 1, h = 1, text = self:getTextFromXPointers(a, b) } } end
++function doc:getCurrentPage() return 1 end
++local painted
++hm._ensureViewModule = function() end
++hm._refreshWordHighlight = function(_, boxes) painted = boxes[1].text end
++local e1 = td[1]
++e1.words = {
++    { start_time = 1.0, end_time = 1.2, text = "One" },
++    { start_time = 1.2, end_time = 1.5, text = "dollar" },
++    { start_time = 1.5, end_time = 1.6, text = "and" },
++    { start_time = 1.6, end_time = 1.9, text = "eighty" },
++    { start_time = 1.9, end_time = 2.2, text = "seven" },
++    { start_time = 2.2, end_time = 2.6, text = "cents." },
++}
++plugin.getSetting = function(_, k, d) if k == "highlight_words" then return true end return d end
++for i, want in ipairs({ "One", "dollar", "and", "eighty-seven", "eighty-seven", "cents." }) do
++    painted = nil
++    hm:highlightWord(e1.words[i], { sentences = { e1 } })
++    eq(painted, want, "word " .. i .. " box")
++end
++
++if #failures > 0 then
++    print(string.format("FAIL %d/%d", #failures, checks))
++    for _, f in ipairs(failures) do print("  " .. f) end
++    os.exit(1)
++end
++print(string.format("ok %d checks", checks))
+diff --git a/docs/READALONG_SIDECAR.md b/docs/READALONG_SIDECAR.md
+new file mode 100644
+index 0000000..40aeb3f
+--- /dev/null
++++ b/docs/READALONG_SIDECAR.md
+@@ -0,0 +1,80 @@
++# Read-along sidecar (unmodified EPUB + Audiobookshelf audiobook)
++
++Word/sentence read-along for books that have **no** Media Overlays. The EPUB
++stays untouched; the timing lives in a sidecar file next to it, generated
++off-device by forced alignment (`make_readalong_sidecar.py`). Audio is the
++book's Audiobookshelf item, downloaded through the plugin's ABS browser, so
++listening position syncs back to ABS.
++
++```
++Books/
++  The Gift of the Magi.epub              <- the normal EPUB
++  The Gift of the Magi.readalong.json    <- this sidecar
++```
++
++The plugin looks for `<book>.readalong.json`, then `<book>.epub.readalong.json`.
++When one exists it is used instead of the EPUB's own SMIL; the EPUB's SMIL
++remains the fallback if the sidecar cannot be used (for example, the
++audiobook is not downloaded yet).
++
++## Format v1
++
++UTF-8 JSON, one object:
++
++| key | meaning |
++|---|---|
++| `format` | `"koreader-readalong"` |
++| `version` | `1` |
++| `generator`, `created` | informational |
++| `granularity` | `"sentence+word"`: one cue per sentence, word timings inside |
++| `book.title`, `book.file`, `book.sha1` | identifies the EPUB the cues were made for |
++| `book.spine` | content-document basenames in spine order; position N (1-based) is crengine's `DocFragment[N]` |
++| `audio.abs_item_id` | Audiobookshelf library item id (`li_...`) whose position is synced; may be `""` |
++| `audio.duration` | total seconds |
++| `audio.tracks[]` | `{index, file, duration, offset}` in ABS `media.audioFiles` order; `offset` = global start second of the track |
++| `audio.audio_dir` | optional: folder (relative to the sidecar) holding the track files for offline use without ABS |
++| `stats` | alignment statistics from the generator |
++| `cue_fields` | names of the cue array columns (v1: below) |
++| `cues[]` | arrays, ordered by time and by reading order |
++
++Cue columns (`cue_fields`):
++
++| # | name | type | meaning |
++|---|---|---|---|
++| 1 | `t0` | number | global start, seconds (ABS book timeline) |
++| 2 | `t1` | number | global end |
++| 3 | `spine` | int | 1-based spine index of the content document |
++| 4 | `xp` | string | crengine xpointer of the cue's first character, e.g. `/body/DocFragment[3]/body/div[1]/p[19]/text().426` (element path with 1-based same-name sibling indices; `text()[k]` counts non-whitespace text nodes; offset is in whitespace-collapsed text) |
++| 5 | `bxp` | string | xpointer of the enclosing block element (`p`, `div`, `li`, `h1`…) |
++| 6 | `bw` | int | 0-based index of the cue's first word among the block's whitespace-separated words |
++| 7 | `text` | string | the sentence as printed (used to verify the range and as the text-match fallback) |
++| 8 | `words` | array | `[[start_ms, dur_ms, "word"], ...]`, start relative to `t0`; may be empty |
++
++Global time to track: the track with the largest `offset <= t0`; local time = `t - offset`.
++
++## How the plugin uses it (`readalongsidecar.lua`)
++
++* Resolves audio: track files next to the sidecar (or in `audio_dir`) first,
++  else the plugin's ABS download of `audio.abs_item_id` (the file count must
++  match `tracks`).
++* Turns cues into the same timing entries the SMIL parser produces (ids
++  `ra:<n>`, track-local times, `words`), so MediaSync overlay mode does the
++  rest: sentence highlight, optional moving word highlight (**Highlight words**),
++  e-ink cue grouping, page follow, chapter list, "Play aligned from here".
++* Start xpointer per cue: tries `xp` (nudged up to 3 characters for whitespace
++  differences), verifies the cue's opening words are really there, else walks
++  the words of `bxp` and takes the occurrence closest to `bw`. If both fail,
++  the existing on-page text matching is used.
++* Position sync: while a sidecar book plays, progress goes to
++  `audio.abs_item_id` as global seconds (track offset + local position) on the
++  usual 60 s / pause / stop schedule. Starting from the menu offers the ABS
++  position first ("Jump there?"), so listening on the phone moves the book.
++* Tap text → audio: select text and use **Play aligned from here**; the cue
++  is matched by block path then sentence text.
++
++## Generating one
++
++See `make_readalong_sidecar.py` (faster-whisper word timestamps, CUDA when
++available; windowed fuzzy alignment to the EPUB words; re-transcription of
++stretches Whisper skipped; interpolation of short gaps). Validate with
++`validate_sidecar.py`.
+diff --git a/highlightmanager.lua b/highlightmanager.lua
+index 73a12a1..8fb4a9b 100644
+--- a/highlightmanager.lua
++++ b/highlightmanager.lua
+@@ -333,6 +333,12 @@ end
+ -- behavior.
+ function HighlightManager:_resolveFragmentXPointer(doc, fragment_id, text_doc)
+     if not doc or not fragment_id then return nil end
++    -- Read-along sidecar entries (unmodified EPUB, ids "ra:<n>") carry their
++    -- own crengine xpointers; the sidecar parser resolves and verifies them.
++    local parser = self.plugin and self.plugin._smil_parser
++    if parser and parser.is_sidecar and parser.resolveFragment then
++        return parser:resolveFragment(doc, fragment_id)
++    end
+     local function try_xp(xp)
+         local ok, nx = pcall(function() return doc:getNormalizedXPointer(xp) end)
+         if ok and nx and nx ~= false then return nx end
+@@ -421,6 +427,17 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
+     else
+         next_id = self:_nextSmilFragmentId(sentence)
+     end
++    local sc_parser = self.plugin and self.plugin._smil_parser
++    if next_id and sc_parser and sc_parser.is_sidecar then
++        -- Sidecar: the next cue's start is the limit; resolve it the same way.
++        pcall(function()
++            local nxp = sc_parser:resolveFragment(doc, next_id)
++            if nxp and doc.getPrevVisibleWordEnd then
++                xp_limit = doc:getPrevVisibleWordEnd(nxp)
++            end
++        end)
++        next_id = nil
++    end
+     if next_id and doc.getNormalizedXPointer then
+         pcall(function()
+             -- The next SMIL fragment may share this sentence's namespace
+@@ -1205,6 +1222,10 @@ function HighlightManager:highlightWord(word, parsed_data)
+             and self.plugin:getSetting("highlight_words", false) ~= true then
+         return
+     end
++    local sent = parsed_data and parsed_data.sentences and parsed_data.sentences[1]
++    if sent and sent.sidecar then
++        return self:_highlightSidecarWord(word, sent)
++    end
+     local ctx = self._word_ctx
+     if not ctx or not ctx.sent_text then return end
+     if not self:_boxesMatchCurrentView() then return end
+@@ -1224,6 +1245,64 @@ function HighlightManager:highlightWord(word, parsed_data)
+     self:_refreshWordHighlight(boxes, ctx.page)
+ end
+ 
++local function foldChars(s)
++    s = tostring(s or ""):lower()
++    return (s:gsub("[%z\1-\47\58-\64\91-\96\123-\127]", ""))
++end
++
++--- Read-along sidecar: word boxes come from walking crengine words from the
++--- cue's resolved start xpointer (the sidecar cue has no on-page text
++--- context).  Sidecar words map onto crengine words by folded-character
++--- position, so differing tokenisation (em-dashes, hyphens) cannot drift.
++function HighlightManager:_highlightSidecarWord(word, sentence)
++    local doc = self.ui and self.ui.document
++    local parser = self.plugin and self.plugin._smil_parser
++    if not (doc and parser and parser.resolveFragment and sentence.words) then return end
++    local idx
++    for i, w in ipairs(sentence.words) do
++        if w == word then idx = i break end
++    end
++    if not idx then return end
++    local walk = self._sc_word_walk
++    if not walk or walk.fid ~= sentence.fragment_id then
++        local xp0 = parser:resolveFragment(doc, sentence.fragment_id)
++        if not xp0 then return end
++        walk = { fid = sentence.fragment_id, words = {} }
++        local total = #foldChars(sentence.text)
++        local pos, ws = 0, xp0
++        for _ = 1, #sentence.words + 40 do
++            local we
++            pcall(function() we = doc:getNextVisibleWordEnd(ws) end)
++            if not we then break end
++            local t = ""
++            pcall(function() t = doc:getTextFromXPointers(ws, we) or "" end)
++            local n = #foldChars(t)
++            walk.words[#walk.words + 1] = { ws = ws, we = we, c0 = pos, c1 = pos + n }
++            pos = pos + n
++            if pos >= total then break end
++            local nxt
++            pcall(function() nxt = doc:getNextVisibleWordStart(we) end)
++            if not nxt or nxt == ws then break end
++            ws = nxt
++        end
++        self._sc_word_walk = walk
++    end
++    local c = 0
++    for i = 1, idx - 1 do c = c + #foldChars(sentence.words[i].text) end
++    local target
++    for _, w in ipairs(walk.words) do
++        if c >= w.c0 and c < math.max(w.c1, w.c0 + 1) then target = w break end
++    end
++    if not target then return end
++    local boxes
++    pcall(function() boxes = doc:getScreenBoxesFromPositions(target.ws, target.we, true) end)
++    if not boxes or #boxes == 0 then return end
++    self._pending_word_boxes = boxes
++    self:_ensureViewModule()
++    self:_refreshWordHighlight(boxes, doc:getCurrentPage())
++    return target
++end
++
+ --[[--
+ Refresh only the strip the word box moved through (its own last-boxes
+ tracking, so the sentence refresh and the word refresh never widen each
+diff --git a/main.lua b/main.lua
+index 761f4e2..e84e947 100644
+--- a/main.lua
++++ b/main.lua
+@@ -1512,6 +1512,12 @@ function Audiobook:_documentHasMediaOverlays(doc_path)
+     if not doc_path then return false end
+     local ext = doc_path:match("%.([^.]+)$") or ""
+     if ext:lower() ~= "epub" then return false end
++    -- A read-along sidecar next to an unmodified EPUB counts as built-in
++    -- narration (audio from Audiobookshelf; docs/READALONG_SIDECAR.md).
++    local Sidecar = self:_readalongSidecarModule()
++    if Sidecar and Sidecar.findSidecar(doc_path) then
++        return true
++    end
+     -- Quick zip listing check for .smil files
+     local h = io.popen('unzip -l "' .. doc_path:gsub('"', '\\"') .. '" 2>/dev/null | grep -i "\\.smil"')
+     if h then
+@@ -1524,6 +1530,100 @@ function Audiobook:_documentHasMediaOverlays(doc_path)
+     return false
+ end
+ 
++function Audiobook:_readalongSidecarModule()
++    if self._ra_sidecar_mod == nil then
++        local ok, mod = pcall(dofile, PLUGIN_PATH .. "readalongsidecar.lua")
++        if not ok then logger.warn("Audiobook: readalongsidecar module failed:", mod) end
++        self._ra_sidecar_mod = (ok and mod) or false
++    end
++    return self._ra_sidecar_mod or nil
++end
++
++--- Timing source for a book: the read-along sidecar next to the EPUB when
++--- present (primary), else the EPUB's own Media Overlays (fallback).
++--- Returns parser, timing_data, err.
++function Audiobook:_loadReadalongTiming(doc_path, plugin_dir, EpubMediaOverlay, progress)
++    local Sidecar = self:_readalongSidecarModule()
++    local sc_path = Sidecar and Sidecar.findSidecar(doc_path)
++    local sc_err
++    if sc_path then
++        local p = Sidecar:new{ sidecar_path = sc_path }
++        local ok, td, err = pcall(p.loadFromEpub, p, doc_path, plugin_dir, progress)
++        if ok and td then
++            dlog("sidecar ready:", #td, "cues, audio from", tostring(p.audio_source))
++            return p, td
++        end
++        sc_err = ok and err or td
++        logger.warn("Audiobook: readalong sidecar unusable:", sc_err)
++        dlog("sidecar load failed:", tostring(sc_err))
++    end
++    local parser = EpubMediaOverlay:new()
++    local td, err = parser:loadFromEpub(doc_path, plugin_dir, progress)
++    if not td and sc_err then
++        err = "read-along sidecar: " .. tostring(sc_err)
++    end
++    return parser, td, err
++end
++
++--- Message for a failed timing load: sidecar problems are actionable
++--- ("download this audiobook from Audiobookshelf first"), so show them.
++function Audiobook:_readalongLoadFailText(err)
++    local why = tostring(err or "")
++    if why:find("^read%-along sidecar: ") then
++        return T(_("Read-along: %1"), why:gsub("^read%-along sidecar: ", ""))
++    end
++    return _("This book has no built-in audiobook.")
++end
++
++--- Point ABS progress sync at the sidecar's Audiobookshelf item (global book
++--- time = track offset + local position); clear it for media-overlay EPUBs,
++--- whose embedded audio is not an ABS timeline.
++function Audiobook:_armReadalongAbs(parser)
++    local ms = self.media_sync
++    if not ms then return end
++    if parser and parser.is_sidecar and parser.abs_item_id then
++        ms._abs_item_id = parser.abs_item_id
++        ms._abs_duration = parser.total_duration or 0
++        ms._readalong_track_offsets = parser.track_offsets
++        ms._chapters_global = false
++        dlog("sidecar ABS sync armed for", parser.abs_item_id)
++    else
++        ms._readalong_track_offsets = nil
++        ms._abs_item_id = nil
++        ms._abs_duration = nil
++    end
++end
++
++--- Sidecar books: offer the Audiobookshelf position (e.g. from the phone)
++--- when it differs from where the reader is.  Calls cont(entry_or_nil).
++function Audiobook:_offerReadalongAbsResume(parser, cont)
++    if not (parser and parser.is_sidecar and parser.abs_item_id and self._abs_sync) then
++        return cont(nil)
++    end
++    local pos
++    pcall(function()
++        local ABSClient = dofile(PLUGIN_PATH .. "absclient.lua")
++        local server_url = self:getSetting("abs_server_url", "")
++        local token = self:getSetting("abs_api_token", "")
++        local client
++        if ABSClient and server_url ~= "" and token ~= "" then
++            client = ABSClient:new{ server_url = server_url, token = token }
++        end
++        pos = self._abs_sync:getBestPosition(client, parser.abs_item_id)
++    end)
++    local entry = pos and pos > 10 and parser:entryAtGlobalTime(pos)
++    if not entry then return cont(nil) end
++    local ConfirmBox = require("ui/widget/confirmbox")
++    UIManager:show(ConfirmBox:new{
++        text = T(_("Audiobookshelf position: %1\n\n%2\n\nJump there?"),
++            self:_formatAudioTime(pos), (entry.text or ""):sub(1, 120)),
++        ok_text = _("Jump there"),
++        cancel_text = _("Not now"),
++        ok_callback = function() cont(entry) end,
++        cancel_callback = function() cont(nil) end,
++    })
++end
++
+ function Audiobook:_hasMediaOverlays()
+     if not self.ui or not self.ui.document then return false end
+     if not self.ui.rolling then return false end
+@@ -1900,11 +2000,10 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
+         UIManager:show(loading_msg)
+         UIManager:forceRePaint()
+ 
+-        parser = EpubMediaOverlay:new()
+         local plugin_dir = PLUGIN_PATH:sub(1, -2)
+         local err
+-        timing_data, err = parser:loadFromEpub(doc_path, plugin_dir,
+-            self:_smilProgressUi(loading_msg))
++        parser, timing_data, err = self:_loadReadalongTiming(doc_path, plugin_dir,
++            EpubMediaOverlay, self:_smilProgressUi(loading_msg))
+ 
+         UIManager:close(loading_msg)
+         UIManager:forceRePaint()
+@@ -1920,7 +2019,7 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
+                 book = doc_path and doc_path:match("([^/]+)$") or nil,
+             })
+             UIManager:show(InfoMessage:new{
+-                text = _("This book has no built-in audiobook."),
++                text = self:_readalongLoadFailText(err),
+                 timeout = 4,
+             })
+             return
+@@ -2109,6 +2208,9 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
+ 
+         local started = self.media_sync:start(first, by_file[first].timing,
+             by_file[first].chapters, nil, playlist, first, start_position, opts)
++        -- Sidecar books sync position to their Audiobookshelf item; media
++        -- overlay EPUBs must not inherit a previous ABS session's item.
++        self:_armReadalongAbs(parser)
+         if started and start_position then
+             logger.warn("Audiobook: SMIL", opts.prepare_only and "prepared" or "playback started",
+                 "at", start_position, "for", first:match("([^/]+)$"))
+@@ -2180,7 +2282,19 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
+     end
+ 
+     -- When invoked from the main menu, offer to resume from the last saved position.
+-    if allow_resume then
++    -- Sidecar books first offer the Audiobookshelf position (listening on
++    -- the phone moves it), then fall back to the usual local prompt.
++    if allow_resume and parser and parser.is_sidecar and not (start_entry and start_entry.audio_path) then
++        self:_offerReadalongAbsResume(parser, function(abs_entry)
++            if abs_entry then
++                do_start(abs_entry)
++            else
++                self:_promptResumeAlignedPlayback(doc_path, timing_data, start_entry, function(chosen_entry)
++                    do_start(chosen_entry)
++                end)
++            end
++        end)
++    elseif allow_resume then
+         self:_promptResumeAlignedPlayback(doc_path, timing_data, start_entry, function(chosen_entry)
+             do_start(chosen_entry)
+         end)
+@@ -2290,6 +2404,14 @@ function Audiobook:_playAudioFile(file_path, playlist_files, start_position_over
+     -- Explicit position (chapter jump onto another part, mapped resume):
+     -- skip the saved-position prompt entirely.
+     if start_position_override then
++        -- Overlay/sidecar playlist part: keep its timing slice installed.
++        local slot = self._smil_by_file and self._smil_by_file[file_path]
++        if slot and self._smil_parser and self._smil_parser.is_sidecar then
++            self.media_sync:start(file_path, slot.timing, slot.chapters, nil,
++                playlist_files or self.media_sync.playlist_files, file_path,
++                start_position_override)
++            return
++        end
+         self:_doPlayAudioFile(file_path, playlist_files, start_position_override)
+         return
+     end
+@@ -2389,6 +2511,7 @@ function Audiobook:_doPlayAudioFile(file_path, playlist_files, start_position, a
+         -- synced duration is the whole book, not the single part being
+         -- played.
+         self.media_sync._abs_item_id = abs_item_id
++        self.media_sync._readalong_track_offsets = nil
+         self._abs_playlist_durations = nil
+         self.media_sync._playlist_durations = nil
+         self.media_sync._chapters_global = false
+@@ -2427,6 +2550,7 @@ function Audiobook:_doPlayAudioFile(file_path, playlist_files, start_position, a
+     else
+         -- Clear ABS tracking for non-ABS playback
+         self.media_sync._abs_item_id = nil
++        self.media_sync._readalong_track_offsets = nil
+         self.media_sync._abs_duration = nil
+         self._abs_playlist_durations = nil
+         self.media_sync._playlist_durations = nil
+@@ -3245,10 +3369,9 @@ function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allo
+         }
+         UIManager:show(loading_msg)
+         UIManager:forceRePaint()
+-        parser = EpubMediaOverlay:new()
+         local err
+-        timing_data, err = parser:loadFromEpub(doc_path, PLUGIN_PATH:sub(1, -2),
+-            self:_smilProgressUi(loading_msg))
++        parser, timing_data, err = self:_loadReadalongTiming(doc_path, PLUGIN_PATH:sub(1, -2),
++            EpubMediaOverlay, self:_smilProgressUi(loading_msg))
+         UIManager:close(loading_msg)
+         UIManager:forceRePaint()
+         if not timing_data then
+@@ -3262,7 +3385,7 @@ function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allo
+                 book = doc_path and doc_path:match("([^/]+)$") or nil,
+             })
+             UIManager:show(InfoMessage:new{
+-                text = _("This book has no built-in audiobook."),
++                text = self:_readalongLoadFailText(err),
+                 timeout = 3,
+             })
+             return
+@@ -4042,6 +4165,10 @@ end
+ function Audiobook:_resolveSmilXPointer(text_doc, fragment_id)
+     local doc = self.ui and self.ui.document
+     if not doc or not fragment_id then return nil end
++    local parser = self._smil_parser
++    if parser and parser.is_sidecar and parser.resolveFragment then
++        return parser:resolveFragment(doc, fragment_id)
++    end
+     local ok, norm = pcall(function()
+         return doc:getNormalizedXPointer("#" .. fragment_id)
+     end)
+@@ -5085,6 +5212,16 @@ end
+ -- is active or the durations are unknown.
+ function Audiobook:_absGlobalPlaybackPos(local_pos)
+     local ms = self.media_sync
++    -- Read-along sidecar: every track's global offset is known exactly
++    -- (tracks without narration cues are not in the overlay playlist, so
++    -- summing playlist durations would undercount).
++    local offs = ms and ms._readalong_track_offsets
++    if offs then
++        local path = ms.media_engine and ms.media_engine.current_path
++        if path and offs[path] then
++            return offs[path] + (local_pos or 0)
++        end
++    end
+     if not (ms and ms.playlist_files and ms.current_playlist_idx
+             and ms.current_playlist_idx > 1) then
+         return local_pos
+diff --git a/mediasync.lua b/mediasync.lua
+index 1b97b71..1538556 100644
+--- a/mediasync.lua
++++ b/mediasync.lua
+@@ -123,6 +123,23 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
+     if not ui or not ui.document then return false end
+     if not fragment_id then return false end
+ 
++    -- Read-along sidecar (unmodified EPUB): the parser resolves "ra:<n>"
++    -- to a verified crengine xpointer; jump straight there.
++    local sc_parser = self.plugin and self.plugin._smil_parser
++    if sc_parser and sc_parser.is_sidecar and sc_parser.resolveFragment then
++        local target
++        pcall(function() target = sc_parser:resolveFragment(ui.document, fragment_id) end)
++        if target and ui.rolling then
++            local ok = pcall(function() ui.rolling:onGotoXPointer(target, target) end)
++            if ok then
++                UIManager:setDirty("all", "partial")
++                return true
++            end
++        end
++        -- Unresolved: fall through; the text-search strategy below still
++        -- finds the sentence (the "#id" strategies simply miss).
++    end
++
+     local xp = "#" .. fragment_id
+     -- crengine namespaces ids from merged content documents as
+     -- "_doc_fragment_<n>_ <original-id>" — resolving with the raw id
+@@ -401,6 +418,11 @@ end
+ function MediaSync:_fragmentInDocument(fragment_id, text_doc)
+     local ui = self.plugin and self.plugin.ui
+     if not ui or not ui.document or not fragment_id then return false end
++    local sc_parser = self.plugin and self.plugin._smil_parser
++    if sc_parser and sc_parser.is_sidecar and sc_parser.resolveFragment then
++        local ok, xp = pcall(sc_parser.resolveFragment, sc_parser, ui.document, fragment_id)
++        return (ok and xp) and true or false
++    end
+     local hm = self.highlight_manager
+     local crengine_id = hm and hm:_toCrengineId(fragment_id, text_doc)
+     local ids = crengine_id and { crengine_id, fragment_id } or { fragment_id }
+@@ -2209,7 +2231,11 @@ function MediaSync:_fragmentVisiblePrefix(sentence, sent_words)
+     -- the raw id when the spine index is unavailable.
+     local hm = self.highlight_manager
+     local crengine_id = (hm and hm:_toCrengineId(fid, sentence and sentence.text_doc)) or fid
++    local sc_parser = self.plugin and self.plugin._smil_parser
+     local ok, xp = pcall(function()
++        if sc_parser and sc_parser.is_sidecar and sc_parser.resolveFragment then
++            return sc_parser:resolveFragment(doc, fid)
++        end
+         return doc:getNormalizedXPointer("#" .. crengine_id)
+     end)
+     if not (ok and xp and xp ~= false) then return nil end
+diff --git a/package-for-kobo.sh b/package-for-kobo.sh
+index 3f09872..aca16f6 100644
+--- a/package-for-kobo.sh
++++ b/package-for-kobo.sh
+@@ -66,7 +66,7 @@ rm -rf "$BUNDLE_DIR"
+ mkdir -p "$ESPEAK_DEST/bin" "$ESPEAK_DEST/lib" "$ESPEAK_DEST/share/espeak-ng-data/lang/gmw" "$ESPEAK_DEST/share/espeak-ng-data/voices"
+ 
+ # Plugin Lua files first
+-for f in absbrowse.lua abscache.lua absclient.lua abssync.lua androidmediasession.lua androidplayer.lua androidtts.lua audiobook_gettext.lua audiobookplayer.lua benchmarkrunner.lua btmanager.lua btmediacontrol.lua btui.lua bugreport.lua debuglog.lua downloader.lua epubmediaoverlay.lua highlightmanager.lua m4bparser.lua audioout.lua main.lua mediaaligner.lua mediaengine.lua mediasync.lua menubuilder.lua _meta.lua piperqueue.lua sessionrecorder.lua synccontroller.lua textparser.lua transcoder.lua ttsengine.lua updater.lua utils.lua wavutils.lua; do
++for f in absbrowse.lua abscache.lua absclient.lua abssync.lua androidmediasession.lua androidplayer.lua androidtts.lua audiobook_gettext.lua audiobookplayer.lua benchmarkrunner.lua btmanager.lua btmediacontrol.lua btui.lua bugreport.lua debuglog.lua downloader.lua epubmediaoverlay.lua highlightmanager.lua readalongsidecar.lua m4bparser.lua audioout.lua main.lua mediaaligner.lua mediaengine.lua mediasync.lua menubuilder.lua _meta.lua piperqueue.lua sessionrecorder.lua synccontroller.lua textparser.lua transcoder.lua ttsengine.lua updater.lua utils.lua wavutils.lua; do
+     if [ -f "$SCRIPT_DIR/$f" ]; then
+         cp "$SCRIPT_DIR/$f" "$PLUGIN_DEST/"
+     fi
+diff --git a/readalongsidecar.lua b/readalongsidecar.lua
+new file mode 100644
+index 0000000..46c6bff
+--- /dev/null
++++ b/readalongsidecar.lua
+@@ -0,0 +1,445 @@
++--[[--
++Read-along sidecar: word/sentence timings for an UNMODIFIED EPUB, stored next
++to it as `<book>.readalong.json` and generated off-device (see
++docs/READALONG_SIDECAR.md).  Audio comes from the book's Audiobookshelf item
++(downloaded through the plugin's ABS browser) or from track files placed next
++to the sidecar.  Times in the sidecar are global book seconds; entries are
++emitted per audio track with track-local times so the existing SMIL overlay
++playback (MediaSync overlay mode) drives highlighting, page follow and
++"play from here" unchanged.
++
++Duck-types the parts of EpubMediaOverlay that main.lua uses:
++loadFromEpub(), _spine_hrefs, _chapter_titles, getCacheDir().
++
++@module koplugin.audiobook.readalongsidecar
++--]]
++
++local ok_logger, logger = pcall(require, "logger")
++if not ok_logger then
++    logger = setmetatable({}, { __index = function() return function() end end })
++end
++
++local Sidecar = {
++    FORMAT = "koreader-readalong",
++    VERSION = 1,
++    ID_PREFIX = "ra:",
++}
++
++function Sidecar:new(o)
++    o = o or {}
++    setmetatable(o, self)
++    self.__index = self
++    o.is_sidecar = true
++    o._spine_hrefs = {}
++    o._chapter_titles = {}
++    o._by_frag = {}
++    o._xp_cache = {}
++    return o
++end
++
++-- ---------------------------------------------------------------------------
++-- Locating and decoding
++-- ---------------------------------------------------------------------------
++
++local function file_exists(p)
++    local f = p and io.open(p, "rb")
++    if f then f:close() return true end
++    return false
++end
++
++--- Sidecar path for a book, or nil.  Looks for `Book.readalong.json` then
++--- `Book.epub.readalong.json` in the book's folder.
++function Sidecar.findSidecar(doc_path)
++    if type(doc_path) ~= "string" or doc_path == "" then return nil end
++    local stem = doc_path:gsub("%.[Ee][Pp][Uu][Bb]$", "")
++    for _, cand in ipairs({ stem .. ".readalong.json", doc_path .. ".readalong.json" }) do
++        if file_exists(cand) then return cand end
++    end
++    return nil
++end
++
++--- Minimal JSON decoder (fallback when KOReader's `json` module is absent,
++--- e.g. in tests).  Handles the subset the generator writes.
++function Sidecar.decodeJson(s)
++    local pos = 1
++    local function ws() pos = s:find("[^ \t\r\n]", pos) or #s + 1 end
++    local val
++    local function str()
++        local out, i = {}, pos + 1
++        while true do
++            local c = s:sub(i, i)
++            if c == "" then error("unterminated string") end
++            if c == '"' then pos = i + 1 return table.concat(out) end
++            if c == "\\" then
++                local e = s:sub(i + 1, i + 1)
++                local map = { b = "\b", f = "\f", n = "\n", r = "\r", t = "\t", ['"'] = '"', ["\\"] = "\\", ["/"] = "/" }
++                if e == "u" then
++                    local cp = tonumber(s:sub(i + 2, i + 5), 16)
++                    i = i + 6
++                    if cp >= 0xD800 and cp <= 0xDBFF and s:sub(i, i + 1) == "\\u" then
++                        local lo = tonumber(s:sub(i + 2, i + 5), 16)
++                        cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
++                        i = i + 6
++                    end
++                    if cp < 0x80 then out[#out + 1] = string.char(cp)
++                    elseif cp < 0x800 then out[#out + 1] = string.char(0xC0 + math.floor(cp / 64), 0x80 + cp % 64)
++                    elseif cp < 0x10000 then out[#out + 1] = string.char(0xE0 + math.floor(cp / 4096), 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64)
++                    else out[#out + 1] = string.char(0xF0 + math.floor(cp / 262144), 0x80 + math.floor(cp / 4096) % 64, 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64) end
++                else
++                    out[#out + 1] = map[e] or e
++                    i = i + 2
++                end
++            else
++                local j = s:find('["\\]', i) or (#s + 1)
++                out[#out + 1] = s:sub(i, j - 1)
++                i = j
++            end
++        end
++    end
++    function val()
++        ws()
++        local c = s:sub(pos, pos)
++        if c == "{" then
++            local t = {}
++            pos = pos + 1; ws()
++            if s:sub(pos, pos) == "}" then pos = pos + 1 return t end
++            while true do
++                ws(); local k = str(); ws()
++                pos = pos + 1 -- ':'
++                t[k] = val(); ws()
++                local d = s:sub(pos, pos); pos = pos + 1
++                if d == "}" then return t end
++            end
++        elseif c == "[" then
++            local t = {}
++            pos = pos + 1; ws()
++            if s:sub(pos, pos) == "]" then pos = pos + 1 return t end
++            while true do
++                t[#t + 1] = val(); ws()
++                local d = s:sub(pos, pos); pos = pos + 1
++                if d == "]" then return t end
++            end
++        elseif c == '"' then return str()
++        elseif s:sub(pos, pos + 3) == "true" then pos = pos + 4 return true
++        elseif s:sub(pos, pos + 4) == "false" then pos = pos + 5 return false
++        elseif s:sub(pos, pos + 3) == "null" then pos = pos + 4 return nil
++        else
++            local num = s:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
++            if not num or num == "" then error("bad json at " .. pos) end
++            pos = pos + #num
++            return tonumber(num)
++        end
++    end
++    return val()
++end
++
++local function decode(text)
++    local ok_json, JSON = pcall(require, "json")
++    if ok_json and JSON and JSON.decode then
++        local ok, res = pcall(JSON.decode, text)
++        if ok and type(res) == "table" then return res end
++    end
++    local ok, res = pcall(Sidecar.decodeJson, text)
++    if ok and type(res) == "table" then return res end
++    return nil, tostring(res)
++end
++
++function Sidecar.read(path)
++    local f = io.open(path, "rb")
++    if not f then return nil, "cannot open sidecar" end
++    local text = f:read("*a")
++    f:close()
++    local sc, err = decode(text)
++    if not sc then return nil, "sidecar is not valid JSON: " .. tostring(err) end
++    if sc.format ~= Sidecar.FORMAT then return nil, "not a readalong sidecar" end
++    if tonumber(sc.version) ~= Sidecar.VERSION then
++        return nil, "unsupported sidecar version " .. tostring(sc.version)
++    end
++    if type(sc.cues) ~= "table" or type(sc.audio) ~= "table" or type(sc.audio.tracks) ~= "table"
++        or #sc.audio.tracks == 0 then
++        return nil, "sidecar has no cues or tracks"
++    end
++    return sc
++end
++
++-- ---------------------------------------------------------------------------
++-- Audio resolution
++-- ---------------------------------------------------------------------------
++
++--- Returns paths[] (one per sidecar track) or nil, reason.
++-- 1. Track files next to the sidecar (or in its `audio_dir`).
++-- 2. The ABS item downloaded into the plugin's ABS cache.
++function Sidecar:_resolveAudio(sc, sidecar_path, plugin_dir)
++    local tracks = sc.audio.tracks
++    local dir = sidecar_path:match("^(.*)/[^/]*$") or "."
++    local local_dir = dir
++    if type(sc.audio.audio_dir) == "string" and sc.audio.audio_dir ~= "" then
++        local_dir = sc.audio.audio_dir:sub(1, 1) == "/" and sc.audio.audio_dir
++            or (dir .. "/" .. sc.audio.audio_dir)
++    end
++    local paths, all = {}, true
++    for i, tr in ipairs(tracks) do
++        local p = local_dir .. "/" .. tostring(tr.file or "")
++        if tr.file and file_exists(p) then paths[i] = p else all = false break end
++    end
++    if all then return paths, "local" end
++
++    local item_id = sc.audio.abs_item_id
++    if type(item_id) ~= "string" or item_id == "" then
++        return nil, "audio files not found next to the book and no Audiobookshelf item id in the sidecar"
++    end
++    local cache = self.abs_cache
++    if not cache and plugin_dir then
++        local ok, ABSCache = pcall(dofile, plugin_dir .. "/abscache.lua")
++        if ok and ABSCache then
++            local ok2, c = pcall(function() return ABSCache:new{ plugin_dir = plugin_dir .. "/" } end)
++            if ok2 then cache = c end
++        end
++    end
++    local cached = cache and cache:getAudioPaths(item_id)
++    if not cached or #cached == 0 then
++        return nil, "download this audiobook from Audiobookshelf first (item " .. item_id .. ")"
++    end
++    if #cached ~= #tracks then
++        return nil, string.format("Audiobookshelf item has %d audio files, sidecar expects %d",
++            #cached, #tracks)
++    end
++    for i, p in ipairs(cached) do
++        if not file_exists(p) then return nil, "downloaded audio file missing: " .. tostring(p) end
++        paths[i] = p
++    end
++    return paths, "abs"
++end
++
++-- ---------------------------------------------------------------------------
++-- Timing data
++-- ---------------------------------------------------------------------------
++
++local function field_index(sc)
++    local F = {}
++    for i, k in ipairs(sc.cue_fields or {}) do F[k] = i end
++    -- v1 default order
++    if not F.t0 then
++        F = { t0 = 1, t1 = 2, spine = 3, xp = 4, bxp = 5, bw = 6, text = 7, words = 8 }
++    end
++    return F
++end
++
++--- Pure transform: sidecar + resolved track paths -> plugin timing entries.
++function Sidecar:buildTimingData(sc, paths)
++    local F = field_index(sc)
++    local tracks = sc.audio.tracks
++    local spine = {}
++    for i, h in ipairs((sc.book and sc.book.spine) or {}) do
++        spine[i] = tostring(h):match("([^/]+)$") or tostring(h)
++    end
++    self._spine_hrefs = spine
++    self.track_offsets, self.track_paths, self.track_durations = {}, {}, {}
++    for i, tr in ipairs(tracks) do
++        self.track_offsets[paths[i]] = tonumber(tr.offset) or 0
++        self.track_paths[i] = paths[i]
++        self.track_durations[i] = tonumber(tr.duration)
++    end
++    self.total_duration = tonumber(sc.audio.duration)
++    self.abs_item_id = (type(sc.audio.abs_item_id) == "string" and sc.audio.abs_item_id ~= "")
++        and sc.audio.abs_item_id or nil
++
++    local td, k = {}, 1
++    for ci, c in ipairs(sc.cues) do
++        local g0, g1 = tonumber(c[F.t0]), tonumber(c[F.t1])
++        if g0 and g1 then
++            while k < #tracks and g0 >= (tonumber(tracks[k + 1].offset) or math.huge) do k = k + 1 end
++            while k > 1 and g0 < (tonumber(tracks[k].offset) or 0) do k = k - 1 end
++            local off = tonumber(tracks[k].offset) or 0
++            local dur = tonumber(tracks[k].duration)
++            local s0 = g0 - off
++            local s1 = g1 - off
++            if dur and s1 > dur then s1 = dur end
++            if s1 < s0 then s1 = s0 end
++            local fid = Sidecar.ID_PREFIX .. ci
++            local bxp = c[F.bxp]
++            local elem_path = type(bxp) == "string"
++                and bxp:match("DocFragment%[%d+%]/(.*)$") or nil
++            if elem_path then elem_path = elem_path:gsub("%[1%]", "") end
++            local words
++            if type(c[F.words]) == "table" and #c[F.words] > 0 then
++                words = {}
++                for _, w in ipairs(c[F.words]) do
++                    local ws = s0 + (tonumber(w[1]) or 0) / 1000
++                    words[#words + 1] = {
++                        start_time = ws,
++                        end_time = ws + (tonumber(w[2]) or 0) / 1000,
++                        text = w[3],
++                    }
++                end
++            end
++            local e = {
++                start_time = s0,
++                end_time = s1,
++                global_start = g0,
++                global_end = g1,
++                text = c[F.text] or "",
++                text_ref = nil,
++                audio_src = tracks[k].file,
++                audio_path = paths[k],
++                fragment_id = fid,
++                text_doc = spine[tonumber(c[F.spine]) or 0],
++                spine_index = tonumber(c[F.spine]),
++                xpointer = c[F.xp],
++                block_xpointer = bxp,
++                block_word = tonumber(c[F.bw]) or 0,
++                elem_path = elem_path,
++                words = words,
++                sidecar = true,
++            }
++            td[#td + 1] = e
++            self._by_frag[fid] = e
++        end
++    end
++    self._timing = td
++    return td
++end
++
++function Sidecar:loadFromEpub(epub_path, plugin_dir, progress_callback)
++    local function report(phase, cur, total, detail)
++        if progress_callback then
++            pcall(progress_callback, { phase = phase, current = cur, total = total, detail = detail })
++        end
++    end
++    local path = self.sidecar_path or Sidecar.findSidecar(epub_path)
++    if not path then return nil, "no readalong sidecar" end
++    self.sidecar_path = path
++    report("smil", 1, 2, path:match("([^/]+)$"))
++    local sc, err = Sidecar.read(path)
++    if not sc then return nil, err end
++    local paths, how = self:_resolveAudio(sc, path, plugin_dir)
++    if not paths then return nil, how end
++    self.audio_source = how
++    local td = self:buildTimingData(sc, paths)
++    if #td == 0 then return nil, "sidecar has no usable cues" end
++    -- Chapter titles from the book's NCX (reuses the overlay parser helpers).
++    pcall(function()
++        local EMO = dofile((plugin_dir or ".") .. "/epubmediaoverlay.lua")
++        local p = EMO:new()
++        local opf_path = p:_findOpfPath(epub_path)
++        local opf_xml = opf_path and p:_extractFromZip(epub_path, opf_path)
++        if opf_xml then
++            self._chapter_titles = p:_loadChapterTitles(epub_path, opf_xml, opf_path:match("^(.*)/") or "")
++        end
++    end)
++    self.sidecar = { title = sc.book and sc.book.title, stats = sc.stats, created = sc.created }
++    report("done", #td, 2, string.format("%d cues, %d audio (%s)", #td, #paths, how))
++    logger.warn("ReadalongSidecar: loaded", #td, "cues,", #paths, "tracks from", how)
++    return td
++end
++
++function Sidecar:getCacheDir() return nil end
++function Sidecar:cleanupOldCaches() end
++
++--- Entry at a global (ABS) book time; for "resume at ABS position".
++function Sidecar:entryAtGlobalTime(t)
++    local td = self._timing
++    if not td or #td == 0 or not t then return nil end
++    local lo, hi, best = 1, #td, 1
++    while lo <= hi do
++        local mid = math.floor((lo + hi) / 2)
++        if td[mid].global_start <= t then best = mid lo = mid + 1 else hi = mid - 1 end
++    end
++    return td[best]
++end
++
++function Sidecar:globalPosition(path, local_pos)
++    local off = self.track_offsets and self.track_offsets[path]
++    if not off then return nil end
++    return off + (local_pos or 0)
++end
++
++function Sidecar.isSidecarFragment(fid)
++    return type(fid) == "string" and fid:sub(1, #Sidecar.ID_PREFIX) == Sidecar.ID_PREFIX
++end
++
++-- ---------------------------------------------------------------------------
++-- XPointer resolution against crengine
++-- ---------------------------------------------------------------------------
++
++local function fold(s)
++    s = tostring(s or ""):lower()
++    -- keep ASCII alnum and any multibyte (accented) characters
++    return (s:gsub("[%z\1-\47\58-\64\91-\96\123-\127]", ""))
++end
++
++-- Does crengine text starting at xp begin with the cue's first words?
++local function starts_cue(doc, xp, want)
++    if not xp or want == "" then return false end
++    local e1, e2
++    pcall(function() e1 = doc:getNextVisibleWordEnd(xp) end)
++    if not e1 then return false end
++    pcall(function() e2 = doc:getNextVisibleWordEnd(e1) end)
++    local drawn = ""
++    pcall(function() drawn = doc:getTextFromXPointers(xp, e2 or e1) or "" end)
++    local d = fold(drawn)
++    if d == "" then return false end
++    if #d > #want then d = d:sub(1, #want) end
++    return want:sub(1, #d) == d and #d >= math.min(3, #want)
++end
++
++--- Resolve a sidecar entry to the crengine xpointer of its first word.
++-- 1. The generator's text-node xpointer, nudged +-3 chars for whitespace
++--    differences.  2. Walk the words of the enclosing block and take the
++--    occurrence of the cue's opening words closest to the recorded word
++--    index.  Returns nil when neither lands (callers then fall back to the
++--    plugin's on-page text matching).
++function Sidecar.resolveStartXPointer(doc, e)
++    if not doc or not e then return nil end
++    local want = fold(e.text)
++    if #want > 24 then want = want:sub(1, 24) end
++    local function norm(xp)
++        local ok, nx = pcall(function() return doc:getNormalizedXPointer(xp) end)
++        if ok and nx and nx ~= false then return nx end
++        return nil
++    end
++    if type(e.xpointer) == "string" then
++        local base, off = e.xpointer:match("^(.*)%.(%d+)$")
++        off = tonumber(off)
++        if base and off then
++            for _, d in ipairs({ 0, -1, 1, -2, 2, -3, 3 }) do
++                if off + d >= 0 then
++                    local nx = norm(base .. "." .. (off + d))
++                    if nx and starts_cue(doc, nx, want) then return nx end
++                end
++            end
++        end
++    end
++    local bxp = type(e.block_xpointer) == "string" and norm(e.block_xpointer)
++    if not bxp then return nil end
++    local prefix = bxp:gsub("/text%(%).*$", "")
++    local best, best_d
++    local cur = bxp
++    for i = 0, 1500 do
++        if starts_cue(doc, cur, want) then
++            local d = math.abs(i - (e.block_word or 0))
++            if not best or d < best_d then best, best_d = cur, d end
++            if i > (e.block_word or 0) then break end
++        end
++        local nxt
++        pcall(function() nxt = doc:getNextVisibleWordStart(cur) end)
++        if not nxt or nxt == cur then break end
++        -- stay inside the block ("p[1]" must not match "p[10]")
++        if nxt ~= prefix and nxt:sub(1, #prefix + 1) ~= prefix .. "/"
++            and nxt:sub(1, #prefix + 1) ~= prefix .. "." then break end
++        cur = nxt
++    end
++    return best
++end
++
++--- HighlightManager / MediaSync hook: fragment id -> crengine xpointer.
++function Sidecar:resolveFragment(doc, fragment_id)
++    local cached = self._xp_cache[fragment_id]
++    if cached ~= nil then return cached or nil end
++    local e = self._by_frag[fragment_id]
++    local xp = e and Sidecar.resolveStartXPointer(doc, e)
++    self._xp_cache[fragment_id] = xp or false
++    return xp
++end
++
++return Sidecar
+-- 
+2.47.3
+

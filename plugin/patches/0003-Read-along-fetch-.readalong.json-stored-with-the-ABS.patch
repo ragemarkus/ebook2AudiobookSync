@@ -1,0 +1,317 @@
+From d45a33c1b686d5e95a3695a239e9d8217ed89819 Mon Sep 17 00:00:00 2001
+From: Grok Bot <bot@localhost>
+Date: Sun, 15 Nov 2026 20:45:45 +0000
+Subject: [PATCH 3/4] Read-along: fetch *.readalong.json stored with the ABS
+ item on download; match it to the EPUB by file name or title
+
+---
+ absbrowse.lua                  |  16 ++++-
+ dev/test_readalong_sidecar.lua |  58 +++++++++++++++
+ main.lua                       |  18 ++++-
+ readalongsidecar.lua           | 124 +++++++++++++++++++++++++++++++--
+ 4 files changed, 208 insertions(+), 8 deletions(-)
+
+diff --git a/absbrowse.lua b/absbrowse.lua
+index 47f18aa..915a795 100644
+--- a/absbrowse.lua
++++ b/absbrowse.lua
+@@ -1390,12 +1390,26 @@ function ABSBrowse._downloadItem(plugin, client, item, cache, refresh_callback)
+                 -- Add to cache index
+                 cache:addItem(item, downloaded_paths, cover_ok and cover_path or nil, audio_durations)
+ 
++                -- Read-along sidecar stored with the audiobook on the server
++                -- (any "*.readalong.json" in the item's folder): fetch it so
++                -- the matching EPUB gets word/sentence read-along.
++                local got_sidecar = false
++                pcall(function()
++                    local Sidecar = dofile(plugin.path .. "/readalongsidecar.lua")
++                    local p = Sidecar.fetchFromAbs(client, item, item_dir)
++                    got_sidecar = p ~= nil
++                end)
++
+                 -- Keep the busy banner visible briefly so the user sees the
+                 -- download is complete before the UI unfreezes.
+                 UIManager:scheduleIn(1.5, function()
+                     UIManager:close(busy)
++                    local msg = T(_("Downloaded: %1"), item.media.metadata.title or _("item"))
++                    if got_sidecar then
++                        msg = msg .. "\n" .. _("Read-along timings included: open the matching EPUB and press Play.")
++                    end
+                     UIManager:show(InfoMessage:new{
+-                        text = T(_("Downloaded: %1"), item.media.metadata.title or _("item")),
++                        text = msg,
+                         timeout = 3,
+                     })
+                     -- Return to the page the user came from (not page 0).
+diff --git a/dev/test_readalong_sidecar.lua b/dev/test_readalong_sidecar.lua
+index ce83a0e..654eec4 100644
+--- a/dev/test_readalong_sidecar.lua
++++ b/dev/test_readalong_sidecar.lua
+@@ -85,6 +85,64 @@ local bad, berr = Sidecar.read(tmp .. "/Book.readalong.json")
+ ok(bad == nil and berr, "read rejects non-sidecar JSON")
+ os.execute("rm -rf " .. tmp)
+ 
++-- ── ABS storage: fetch "*.readalong.json" from the item, then find it ────
++do
++    local root = os.tmpname(); os.remove(root)
++    local cache_dir = root .. "/abs_cache"
++    local item_dir = cache_dir .. "/li_777"
++    os.execute("mkdir -p " .. item_dir .. " " .. root .. "/Books")
++    local body = '{"format":"koreader-readalong","version":1,"book":{"title":"The Gift of the Magi",' ..
++        '"file":"The Gift of the Magi.epub","sha1":"abc","spine":["a.xhtml"]},' ..
++        '"audio":{"abs_item_id":"","duration":10,"tracks":[{"index":1,"file":"x.mp3","duration":10,"offset":0}]},' ..
++        '"cues":[[0,1,1,"/body/DocFragment[1]/body/p[1]/text().0","/body/DocFragment[1]/body/p[1]",0,"Hi.",[]]]}'
++    local requested
++    local client = {
++        server_url = "https://abs.example",
++        getItemDetails = function(_, id)
++            return { id = id, libraryFiles = {
++                { ino = "11", metadata = { filename = "01 - Track.mp3" } },
++                { ino = "42", metadata = { filename = "The Gift of the Magi.readalong.json" } },
++                { ino = "12", metadata = { filename = "metadata.json" } },
++            } }
++        end,
++        downloadFile = function(_, url, dest)
++            requested = url
++            local f = io.open(dest, "wb") f:write(body) f:close()
++            return true
++        end,
++    }
++    local path = Sidecar.fetchFromAbs(client, { id = "li_777" }, item_dir)
++    eq(path, item_dir .. "/readalong.json", "fetchFromAbs stores readalong.json")
++    eq(requested, "https://abs.example/api/items/li_777/file/42/download", "fetchFromAbs uses the library-file download API")
++    local p1, id1 = Sidecar.findSidecar(root .. "/Books/The Gift of the Magi.epub", { abs_cache_dir = cache_dir })
++    eq(p1, item_dir .. "/readalong.json", "findSidecar matches ABS sidecar by EPUB file name")
++    eq(id1, "li_777", "findSidecar returns the ABS item id")
++    local p2 = Sidecar.findSidecar(root .. "/Books/gift_magi_v2.epub", { abs_cache_dir = cache_dir, title = "The Gift of the Magi" })
++    eq(p2, item_dir .. "/readalong.json", "findSidecar matches ABS sidecar by title")
++    eq(Sidecar.findSidecar(root .. "/Books/Other.epub", { abs_cache_dir = cache_dir, title = "Other" }), nil,
++        "findSidecar ignores unrelated books")
++    -- the item id comes from the ABS item when the generator left it empty
++    os.execute("mkdir -p " .. item_dir .. "/audio")
++    local f = io.open(item_dir .. "/audio/001-x.mp3", "w") f:write("x") f:close()
++    local lp = Sidecar:new{ abs_cache = { getAudioPaths = function(_, id) if id == "li_777" then return { item_dir .. "/audio/001-x.mp3" } end end } }
++    local ltd, lerr = lp:loadFromEpub(root .. "/Books/The Gift of the Magi.epub", root)
++    ok(ltd ~= nil, "load ABS-fetched sidecar: " .. tostring(lerr))
++    eq(lp.abs_item_id, "li_777", "ABS item id filled from the fetched item")
++    eq(lp.audio_source, "abs", "audio from the ABS download")
++    -- an item without a sidecar
++    local none_client = { server_url = "x", getItemDetails = function() return { libraryFiles = {} } end }
++    local np, nerr = Sidecar.fetchFromAbs(none_client, { id = "li_1" }, item_dir)
++    ok(np == nil and nerr == "none", "fetchFromAbs: item without sidecar")
++    -- invalid JSON is rejected and not left behind
++    local bad_client = { server_url = "x",
++        getItemDetails = function() return { libraryFiles = { { ino = "1", metadata = { filename = "B.readalong.json" } } } } end,
++        downloadFile = function(_, _, dest) local h = io.open(dest, "wb") h:write("<html>") h:close() return true end }
++    local bdir = cache_dir .. "/li_bad"; os.execute("mkdir -p " .. bdir)
++    local bp = Sidecar.fetchFromAbs(bad_client, { id = "li_bad" }, bdir)
++    ok(bp == nil and io.open(bdir .. "/readalong.json") == nil, "fetchFromAbs rejects a non-sidecar response")
++    os.execute("rm -rf " .. root)
++end
++
+ -- ── resolveStartXPointer against a fake crengine document ────────────────
+ local FakeDoc = dofile(here .. "fake_crengine_doc.lua")
+ local base = "/body/DocFragment[3]/body/div"
+diff --git a/main.lua b/main.lua
+index e84e947..0ec5cca 100644
+--- a/main.lua
++++ b/main.lua
+@@ -1515,7 +1515,7 @@ function Audiobook:_documentHasMediaOverlays(doc_path)
+     -- A read-along sidecar next to an unmodified EPUB counts as built-in
+     -- narration (audio from Audiobookshelf; docs/READALONG_SIDECAR.md).
+     local Sidecar = self:_readalongSidecarModule()
+-    if Sidecar and Sidecar.findSidecar(doc_path) then
++    if Sidecar and Sidecar.findSidecar(doc_path, self:_readalongFindOpts()) then
+         return true
+     end
+     -- Quick zip listing check for .smil files
+@@ -1530,6 +1530,17 @@ function Audiobook:_documentHasMediaOverlays(doc_path)
+     return false
+ end
+ 
++--- Where findSidecar also looks: sidecars fetched with ABS downloads,
++--- matched by file name or by the open book's title.
++function Audiobook:_readalongFindOpts()
++    local title
++    pcall(function()
++        local props = self.ui and self.ui.document and self.ui.document:getProps()
++        title = props and props.title
++    end)
++    return { abs_cache_dir = PLUGIN_PATH .. "abs_cache", title = title }
++end
++
+ function Audiobook:_readalongSidecarModule()
+     if self._ra_sidecar_mod == nil then
+         local ok, mod = pcall(dofile, PLUGIN_PATH .. "readalongsidecar.lua")
+@@ -1544,10 +1555,11 @@ end
+ --- Returns parser, timing_data, err.
+ function Audiobook:_loadReadalongTiming(doc_path, plugin_dir, EpubMediaOverlay, progress)
+     local Sidecar = self:_readalongSidecarModule()
+-    local sc_path = Sidecar and Sidecar.findSidecar(doc_path)
++    local sc_path, sc_item = nil, nil
++    if Sidecar then sc_path, sc_item = Sidecar.findSidecar(doc_path, self:_readalongFindOpts()) end
+     local sc_err
+     if sc_path then
+-        local p = Sidecar:new{ sidecar_path = sc_path }
++        local p = Sidecar:new{ sidecar_path = sc_path, abs_item_hint = sc_item }
+         local ok, td, err = pcall(p.loadFromEpub, p, doc_path, plugin_dir, progress)
+         if ok and td then
+             dlog("sidecar ready:", #td, "cues, audio from", tostring(p.audio_source))
+diff --git a/readalongsidecar.lua b/readalongsidecar.lua
+index 46c6bff..a52886e 100644
+--- a/readalongsidecar.lua
++++ b/readalongsidecar.lua
+@@ -47,17 +47,123 @@ local function file_exists(p)
+     return false
+ end
+ 
+---- Sidecar path for a book, or nil.  Looks for `Book.readalong.json` then
+---- `Book.epub.readalong.json` in the book's folder.
+-function Sidecar.findSidecar(doc_path)
++local function norm_key(s)
++    return (tostring(s or ""):lower():gsub("%.epub$", ""):gsub("[^%w\128-\255]", ""))
++end
++
++local function read_meta(path)
++    local f = io.open(path, "rb")
++    if not f then return nil end
++    local m = {}
++    for line in f:lines() do
++        local k, v = line:match("^([%w_]+)=(.*)$")
++        if k then m[k] = v end
++    end
++    f:close()
++    return m
++end
++
++local function list_dirs(root)
++    local out = {}
++    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
++    if ok and lfs and lfs.dir then
++        local ok2 = pcall(function()
++            for name in lfs.dir(root) do
++                if name ~= "." and name ~= ".." then out[#out + 1] = name end
++            end
++        end)
++        if ok2 then return out end
++        out = {}
++    end
++    local h = io.popen('ls -1 "' .. root:gsub('"', '\\"') .. '" 2>/dev/null')
++    if h then
++        for name in h:lines() do out[#out + 1] = name end
++        h:close()
++    end
++    return out
++end
++
++--- Sidecar path for a book, or nil (plus the ABS item id when it came from
++--- the ABS cache).  Order:
++---   1. `Book.readalong.json`, then `Book.epub.readalong.json`, next to the book;
++---   2. a sidecar fetched with an Audiobookshelf download
++---      (`<abs_cache>/<item>/readalong.json`), matched by the EPUB's file
++---      name, then by title.  opts = { abs_cache_dir =, title = }.
++function Sidecar.findSidecar(doc_path, opts)
+     if type(doc_path) ~= "string" or doc_path == "" then return nil end
+     local stem = doc_path:gsub("%.[Ee][Pp][Uu][Bb]$", "")
+     for _, cand in ipairs({ stem .. ".readalong.json", doc_path .. ".readalong.json" }) do
+         if file_exists(cand) then return cand end
+     end
++    local root = opts and opts.abs_cache_dir
++    if not root then return nil end
++    local base = norm_key(doc_path:match("([^/]+)$"))
++    local title = opts.title and norm_key(opts.title)
++    local by_title
++    for _, item_id in ipairs(list_dirs(root)) do
++        local dir = root .. "/" .. item_id
++        local meta = read_meta(dir .. "/readalong.meta")
++        if meta and file_exists(dir .. "/readalong.json") then
++            if meta.file and norm_key(meta.file) == base then
++                return dir .. "/readalong.json", meta.item_id or item_id
++            end
++            if title and title ~= "" and meta.title and norm_key(meta.title) == title and not by_title then
++                by_title = { dir .. "/readalong.json", meta.item_id or item_id }
++            end
++        end
++    end
++    if by_title then return by_title[1], by_title[2] end
+     return nil
+ end
+ 
++--- After an Audiobookshelf download: fetch the item's `*.readalong.json`
++--- (any library file ending in `.readalong.json`, e.g. dropped into the
++--- audiobook's folder on the server) into `<item_dir>/readalong.json` and
++--- write `readalong.meta` so findSidecar can match the EPUB later.
++--- Returns the local path, or nil + reason ("none" when the item has none).
++function Sidecar.fetchFromAbs(client, item, item_dir)
++    if not (client and item and item.id and item_dir) then return nil, "bad arguments" end
++    local files = item.libraryFiles
++    if type(files) ~= "table" or #files == 0 then
++        local ok, details = pcall(client.getItemDetails, client, item.id)
++        files = ok and type(details) == "table" and details.libraryFiles or {}
++    end
++    local cands = {}
++    for _, lf in ipairs(files) do
++        local name = lf.metadata and lf.metadata.filename or ""
++        if name:lower():match("%.readalong%.json$") and lf.ino then cands[#cands + 1] = lf end
++    end
++    if #cands == 0 then return nil, "none" end
++    table.sort(cands, function(a, b) return a.metadata.filename < b.metadata.filename end)
++    local lf = cands[1]
++    local dest = item_dir .. "/readalong.json"
++    local url = client.server_url .. "/api/items/" .. item.id .. "/file/" .. lf.ino .. "/download"
++    local ok, err = client:downloadFile(url, dest .. ".part")
++    if not ok then
++        os.remove(dest .. ".part")
++        return nil, "download failed: " .. tostring(err)
++    end
++    local sc, rerr = Sidecar.read(dest .. ".part")
++    if not sc then
++        os.remove(dest .. ".part")
++        return nil, rerr
++    end
++    os.remove(dest)
++    os.rename(dest .. ".part", dest)
++    local f = io.open(item_dir .. "/readalong.meta", "wb")
++    if f then
++        local book = sc.book or {}
++        f:write("item_id=", tostring(item.id), "\n")
++        f:write("file=", (tostring(book.file or ""):gsub("\n", " ")), "\n")
++        f:write("title=", (tostring(book.title or ""):gsub("\n", " ")), "\n")
++        f:write("sha1=", tostring(book.sha1 or ""), "\n")
++        f:write("source=", (lf.metadata.filename:gsub("\n", " ")), "\n")
++        f:close()
++    end
++    logger.warn("ReadalongSidecar: fetched", lf.metadata.filename, "for", item.id)
++    return dest
++end
++
+ --- Minimal JSON decoder (fallback when KOReader's `json` module is absent,
+ --- e.g. in tests).  Handles the subset the generator writes.
+ function Sidecar.decodeJson(s)
+@@ -306,12 +412,22 @@ function Sidecar:loadFromEpub(epub_path, plugin_dir, progress_callback)
+             pcall(progress_callback, { phase = phase, current = cur, total = total, detail = detail })
+         end
+     end
+-    local path = self.sidecar_path or Sidecar.findSidecar(epub_path)
++    local path = self.sidecar_path
++    if not path then
++        path, self.abs_item_hint = Sidecar.findSidecar(epub_path, {
++            abs_cache_dir = plugin_dir and (plugin_dir .. "/abs_cache") or nil,
++        })
++    end
+     if not path then return nil, "no readalong sidecar" end
+     self.sidecar_path = path
+     report("smil", 1, 2, path:match("([^/]+)$"))
+     local sc, err = Sidecar.read(path)
+     if not sc then return nil, err end
++    -- A sidecar fetched from an ABS item belongs to that item even when the
++    -- generator was run without --abs-item-id.
++    if self.abs_item_hint and (type(sc.audio.abs_item_id) ~= "string" or sc.audio.abs_item_id == "") then
++        sc.audio.abs_item_id = self.abs_item_hint
++    end
+     local paths, how = self:_resolveAudio(sc, path, plugin_dir)
+     if not paths then return nil, how end
+     self.audio_source = how
+-- 
+2.47.3
+
