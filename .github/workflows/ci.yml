@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:          # release.yml runs the same checks before publishing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  LUAJIT_REF: "@v2.1"          # KOReader runs LuaJIT 2.1
+  LUAROCKS_REF: "@v3.12.2"     # >= 3.11 can load the luarocks.org manifest under LuaJIT
+  BUSTED_VERSION: "2.3.0"
+
+jobs:
+  python:
+    name: Python tests (companion + sidecar tools)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install test dependencies
+        # lxml for validate_sidecar.py's xpointer check; Whisper is not needed
+        # (the companion tests use a fake transcriber, the real run is skipped).
+        run: python -m pip install lxml
+      - name: Byte-compile
+        run: python -m compileall -q sidecar companion fallback tools plugin/build_plugin.py
+      - name: Sidecar publish tests
+        run: python sidecar/tests/test_publish_sidecar.py
+      - name: Companion tests
+        run: python -m unittest discover -s companion/tests -v
+
+  lua:
+    name: Lua plugin specs (busted, LuaJIT)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Cache LuaJIT + busted
+        id: lua-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .lua
+          key: lua-${{ runner.os }}-luajit${{ env.LUAJIT_REF }}-luarocks${{ env.LUAROCKS_REF }}-busted${{ env.BUSTED_VERSION }}
+      - name: Install LuaJIT, LuaRocks and busted
+        if: steps.lua-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install hererocks
+          hererocks .lua -j "$LUAJIT_REF" -r "$LUAROCKS_REF"
+          .lua/bin/luarocks install busted "$BUSTED_VERSION"
+      - name: busted
+        run: .lua/bin/busted -o gtest
+      - name: Minimal runner (no-busted fallback)
+        run: .lua/bin/lua plugin/spec/run.lua
+
+  plugin:
+    name: Package KOReader plugin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Cache upstream plugin release (sha256-checked by build_plugin.py)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/audiobook-koplugin-v0.6.13.zip
+          key: upstream-audiobook-koplugin-v0.6.13
+      - name: Build + run the in-plugin Lua tests
+        run: |
+          python -m pip install lupa
+          python plugin/build_plugin.py --test
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audiobook.koplugin
+          path: build/audiobook.koplugin.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  docker:
+    name: Docker build (companion CPU image)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: companion/Dockerfile
+          push: false
+          load: true
+          tags: readalong-companion:ci
+          cache-from: type=gha,scope=companion-cpu
+          cache-to: type=gha,mode=max,scope=companion-cpu
+      - name: Smoke test the image
+        run: |
+          docker run --rm --entrypoint python3 readalong-companion:ci -c \
+            "import faster_whisper, lxml, readalong_companion.web, readalong_companion.worker; print('imports ok')"
+          docker run --rm --entrypoint python3 readalong-companion:ci /app/sidecar/make_readalong_sidecar.py --help >/dev/null
+          docker run -d --name rc -p 8765:8765 -e ABS_URL=http://127.0.0.1:9 -e ABS_TOKEN=x -e WORKER_MODE=off readalong-companion:ci
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8765/api/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8765/api/status | python3 -m json.tool
+          docker rm -f rc

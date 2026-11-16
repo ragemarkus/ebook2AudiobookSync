@@ -1,0 +1,188 @@
+name: Release
+
+# Push a tag like v0.2.0 (or run this workflow by hand with a version) to:
+#  - run CI,
+#  - publish ghcr.io/<owner>/readalong-companion:<version>|latest (CPU) and
+#    :<version>-cuda|latest-cuda (G14 GPU worker),
+#  - build audiobook.koplugin.zip and the companion deploy bundle,
+#  - create a GitHub Release with those files and generated notes.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.2.0 (the tag is created on the selected branch's commit if it doesn't exist)"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      image: ${{ steps.v.outputs.image }}
+    steps:
+      - id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then tag="$INPUT_VERSION"; else tag="$REF_NAME"; fi
+          case "$tag" in v*) ;; *) tag="v$tag";; esac
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$tag' is not a version like v1.2.3 or v1.2.3-rc.1"; exit 1
+          fi
+          version="${tag#v}"
+          pre=false; case "$version" in *-*) pre=true;; esac
+          owner=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "tag=$tag"; echo "version=$version"; echo "prerelease=$pre"
+            echo "image=ghcr.io/$owner/readalong-companion"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (prerelease=$pre)"
+
+  ci:
+    name: CI
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  images:
+    name: Image (${{ matrix.variant }})
+    needs: [meta, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - variant: cpu
+            base: python:3.12-slim
+            suffix: ""
+          - variant: cuda
+            base: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+            suffix: "-cuda"
+    steps:
+      - name: Free disk space (the CUDA image is large)
+        if: matrix.variant == 'cuda'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ needs.meta.outputs.image }}
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }},onlatest=true
+          tags: |
+            type=raw,value=${{ needs.meta.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.meta.outputs.prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.title=readalong-companion${{ matrix.suffix }}
+            org.opencontainers.image.description=Read-along companion: generates KOReader read-along sidecars for Audiobookshelf (${{ matrix.variant }})
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: companion/Dockerfile
+          platforms: linux/amd64
+          build-args: BASE=${{ matrix.base }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,scope=companion-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=companion-${{ matrix.variant }}
+
+  assets:
+    name: Plugin zip + deploy bundle
+    needs: [meta, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/audiobook-koplugin-v0.6.13.zip
+          key: upstream-audiobook-koplugin-v0.6.13
+      - name: Build assets
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          IMAGE: ${{ needs.meta.outputs.image }}
+        run: python companion/release/make_release_assets.py --version "$VERSION" --image "$IMAGE" --out dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: GitHub Release
+    needs: [meta, images, assets]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+          IMAGE: ${{ needs.meta.outputs.image }}
+          TARGET: ${{ github.sha }}
+        run: |
+          cat > notes.md <<NOTES
+          ## Container images
+          - CPU (XPS companion): \`docker pull $IMAGE:$VERSION\`
+          - CUDA (G14 GPU worker): \`docker pull $IMAGE:$VERSION-cuda\`
+
+          ## Files
+          - \`audiobook.koplugin-$VERSION.zip\`: patched KOReader plugin. Unzip into KOReader's \`plugins/\` folder.
+          - \`readalong-companion-deploy-$VERSION.tar.gz\` / \`.zip\`: compose files and env examples pinned to this version. See its README.md.
+          - \`SHA256SUMS\`
+          NOTES
+          flags=(--title "$TAG" --notes-file notes.md --generate-notes --target "$TARGET")
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists: uploading assets"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* "${flags[@]}"
+          fi

@@ -1,18 +1,23 @@
 # Optional GPU worker on the ASUS G14 (RTX 4080 12 GB).  Needs Docker Desktop
 # (WSL2 backend) or Linux + NVIDIA Container Toolkit.  From this folder:
 #   cp worker.env.example worker.env   # then edit it
-#   docker compose -f docker-compose.worker.yml up -d --build
+#   docker compose -f docker-compose.worker.yml pull && docker compose -f docker-compose.worker.yml up -d
+#   (or build from this checkout: docker compose -f docker-compose.worker.yml up -d --build)
+# COMPANION_TAG picks the version (shell env or a .env file next to this file):
+# latest (default) or e.g. 0.2.0; "-cuda" is appended.
 # It pulls jobs from the companion on the XPS, fetches the audio + EPUB through
 # the companion, aligns on the GPU and uploads the sidecar. Stop it whenever:
 # a job it was holding goes back to the queue when its lease expires.
 services:
   readalong-worker:
+    image: ghcr.io/ragemarkus/readalong-companion:${COMPANION_TAG:-latest}-cuda
+    # >>> build (removed from the release deploy bundle)
     build:
       context: ..
       dockerfile: companion/Dockerfile
       args:
         BASE: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
-    image: readalong-companion:gpu
+    # <<< build
     container_name: readalong-worker
     command: ["worker"]
     restart: unless-stopped

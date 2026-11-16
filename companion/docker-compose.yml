@@ -1,13 +1,18 @@
 # Read-along companion on the Dell XPS 13 (CPU).  From this folder:
 #   cp env.example .env   # then edit it
-#   mkdir -p data && docker compose up -d --build
+#   mkdir -p data
+#   docker compose pull && docker compose up -d      # released image from GHCR
+#   docker compose up -d --build                     # or build from this checkout
+# COMPANION_TAG (in .env) picks the image version: latest (default) or e.g. 0.2.0.
 # Web UI: http://<xps-host>:8765  (LAN only: don't publish this port through the tunnel)
 services:
   readalong-companion:
+    image: ghcr.io/ragemarkus/readalong-companion:${COMPANION_TAG:-latest}
+    # >>> build (removed from the release deploy bundle)
     build:
       context: ..
       dockerfile: companion/Dockerfile
-    image: readalong-companion:cpu
+    # <<< build
     container_name: readalong-companion
     restart: unless-stopped
     env_file: .env

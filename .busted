@@ -1,0 +1,8 @@
+-- busted config: `busted` from the repo root runs the KOReader plugin specs.
+return {
+  default = {
+    ROOT = { "plugin/spec" },
+    pattern = "_spec",
+    verbose = true,
+  },
+}

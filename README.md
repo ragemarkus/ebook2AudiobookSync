@@ -27,6 +27,8 @@ The XTEINK X4 Pro's CrossInk firmware can't run plugins.
 | `plugin/build_plugin.py` | Builds the patched plugin. Downloads the upstream v0.6.13 release (sha256-checked), overlays `plugin/overlay/`, writes `build/audiobook.koplugin.zip`, and runs the Lua tests with `--test`. |
 | `plugin/overlay/` | The changed and new plugin files: Cloudflare Access headers, read-along sidecar, and ABS sidecar fetch. |
 | `plugin/patches/` | The same changes as `git format-patch` against upstream tag `v0.6.13` (commit `9a59606`). |
+| `plugin/spec/` | Standalone busted specs for the plugin's Lua (`busted`, or `luajit plugin/spec/run.lua`), KOReader stubbed. |
+| `.github/workflows/` | CI (tests, plugin packaging, Docker build) and Release (GHCR images, plugin zip, deploy bundle). |
 | `plugin/tests/` | Lua tests (`dev/` in the plugin). Run them with `build_plugin.py --test` (needs `pip install lupa`). |
 | `companion/` | Always-on service for the XPS (Docker): watches ABS, generates missing sidecars (CPU, or an optional G14 GPU worker), validates them and writes them into the ABS item folder. Has a web UI and JSON API. See `companion/README.md`. |
 | `fallback/readalong_build.py` | Comparison route: writes the alignment as an EPUB3 Media Overlay book with the audio embedded. |
@@ -114,9 +116,28 @@ Prototype accuracy (Gift of the Magi, 13 min, small.en on CPU):
 - All 165 sentence xpointers land on the right word.
 
 ## Tests
-- `python plugin/build_plugin.py --test`: Lua, sidecar parsing, highlight ranges, ABS fetch and matching.
+- `busted` (from the repo root, see `.busted`): unit specs for the plugin's Lua under `plugin/spec/`, run straight from `plugin/overlay/` with KOReader stubbed. They cover sidecar parsing and validation, timing data, sentence and word lookup by audio time, global/track position mapping, audio resolution, cue to xpointer mapping, and the ABS sidecar auto-fetch and matching.
+  - Without busted: `luajit plugin/spec/run.lua`, or `python tools/luajit.py plugin/spec/run.lua` with `pip install lupa`.
+- `python plugin/build_plugin.py --test`: Lua tests inside the built plugin (with upstream modules): sidecar parsing, highlight ranges, ABS fetch and matching.
 - `python sidecar/tests/test_publish_sidecar.py`: ABS copy, scan and Grimmory upload against a fake server.
 - `python -m unittest discover -s companion/tests -v`: the companion service, against a fake ABS and a fake transcriber.
+
+## CI and releases
+- **CI** (`.github/workflows/ci.yml`) runs on every push to `main`, on pull requests, and by hand. Jobs:
+  - Python tests (companion and sidecar tools; the slow real-Whisper test is skipped);
+  - Lua specs with busted on LuaJIT 2.1;
+  - `build_plugin.py --test` packaging (the plugin zip is kept as a build artifact);
+  - a Docker build and smoke test of the companion CPU image.
+- **Release** (`.github/workflows/release.yml`) runs on a `v*` tag or by hand (Actions → Release → Run workflow → version). It:
+  1. runs CI;
+  2. pushes `ghcr.io/ragemarkus/readalong-companion:<version>` and `:latest` (CPU), plus `:<version>-cuda` and `:latest-cuda` (G14 GPU worker). Pre-releases like `v1.0.0-rc.1` don't move `latest`;
+  3. builds `audiobook.koplugin-<version>.zip` and `readalong-companion-deploy-<version>.tar.gz`/`.zip` (compose files and env examples pinned to that version);
+  4. creates the GitHub Release with those files, `SHA256SUMS` and generated notes.
+- To cut a release:
+  ```
+  git tag v0.2.0 && git push origin v0.2.0
+  ```
+- Container packages pushed to GHCR start **private**. To pull without logging in, make `readalong-companion` public under GitHub → Packages → Package settings. Otherwise run `docker login ghcr.io` on the XPS and G14 with a token that has `read:packages`.
 
 ## Licence and attribution
 - `plugin/` is derived from [stradichenko/audiobook.koplugin](https://github.com/stradichenko/audiobook.koplugin), tag `v0.6.13` (commit `9a59606baddc67d31ed801fe20c942c425aed396`), © its authors, licensed under the **GNU AGPL-3.0**.

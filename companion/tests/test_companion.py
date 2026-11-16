@@ -434,6 +434,38 @@ class TestRemoteWorker(ServerBase):
         self.assertIn("worker g14", self.app.store.get(job["item_id"])["last_error"])
 
 
+class TestReleaseBundle(unittest.TestCase):
+    def test_deploy_bundle_is_pinned_and_has_no_build_section(self):
+        import subprocess
+        import tarfile
+        out = tempfile.mkdtemp()
+        try:
+            script = os.path.join(os.path.dirname(HERE), "release", "make_release_assets.py")
+            subprocess.run([sys.executable, script, "--version", "v1.2.3", "--out", out, "--skip-plugin"],
+                           check=True, capture_output=True)
+            name = "readalong-companion-deploy-1.2.3"
+            with tarfile.open(os.path.join(out, name + ".tar.gz")) as t:
+                files = {os.path.basename(m.name): t.extractfile(m).read().decode()
+                         for m in t.getmembers() if m.isfile()}
+            self.assertEqual(sorted(files), ["BUNDLE.md", "README.md", "docker-compose.worker.yml",
+                                             "docker-compose.yml", "env.example", "worker.env.example"])
+            for f in ("docker-compose.yml", "docker-compose.worker.yml"):
+                self.assertNotIn("build:", files[f])
+                self.assertNotIn("dockerfile", files[f])
+                self.assertIn("ghcr.io/ragemarkus/readalong-companion:${COMPANION_TAG:-1.2.3}", files[f])
+            self.assertIn("COMPANION_TAG=1.2.3", files["env.example"])
+            sums = open(os.path.join(out, "SHA256SUMS")).read()
+            self.assertIn(name + ".zip", sums)
+            try:
+                import yaml
+            except ImportError:
+                return
+            c = yaml.safe_load(files["docker-compose.yml"])["services"]["readalong-companion"]
+            self.assertNotIn("build", c)
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+
 @unittest.skipUnless(os.environ.get("REAL_GENERATOR_PYTHON") and os.environ.get("REAL_DEMO_DIR"),
                      "real faster-whisper run not requested")
 class TestRealGenerator(Base):

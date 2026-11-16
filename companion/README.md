@@ -86,7 +86,11 @@ GET endpoints are open to whoever can reach the port, and it's meant for the LAN
    - `ADMIN_TOKEN`: random, for example `openssl rand -hex 32`.
    - Only for the G14: `WORKER_MODE=both` (or `remote`) and `WORKER_TOKEN=$(openssl rand -hex 32)`.
    - Leave `CF_ACCESS_*` empty on the LAN.
-3. Start it: `docker compose up -d --build`, then `docker compose logs -f`.
+3. Start it with the released image: `docker compose pull && docker compose up -d`. Then `docker compose logs -f`.
+   - `COMPANION_TAG` in `.env` picks the version: `latest`, or a release such as `0.2.0`.
+   - To build from the checkout instead: `docker compose up -d --build`.
+   - The GHCR package is private until it's made public. Otherwise run `docker login ghcr.io` with a token that has `read:packages`.
+   - Each GitHub Release also has a `readalong-companion-deploy-<version>` bundle: just the compose files and env examples, pinned to that version, with no source checkout needed.
    - The first job downloads the Whisper model into `data/models`.
    - Open `http://<xps-host>:8765`.
    - Optional dry run first: `docker compose run --rm readalong-companion scan`, which runs one scan and prints the summary.
@@ -101,7 +105,8 @@ Docker Desktop (WSL2) with GPU support, or Linux with the NVIDIA Container Toolk
 ```
 git clone https://github.com/ragemarkus/ebook2AudiobookSync.git && cd ebook2AudiobookSync/companion
 cp worker.env.example worker.env      # COMPANION_URL=http://<xps-host>:8765, WORKER_TOKEN = the XPS's value
-docker compose -f docker-compose.worker.yml up -d --build
+docker compose -f docker-compose.worker.yml pull     # ghcr.io/ragemarkus/readalong-companion:<COMPANION_TAG>-cuda
+docker compose -f docker-compose.worker.yml up -d    # or: up -d --build to build the CUDA image locally
 ```
 Native Windows instead, using the venv from the main README's "On the G14":
 ```
@@ -128,6 +133,7 @@ set DATA_DIR=%USERPROFILE%\readalong-worker
 ```
 python -m unittest discover -s companion/tests -v
 ```
+- CI runs these on every push. The release bundle is built by `release/make_release_assets.py`, which has its own test.
 - The tests use a fake ABS API, which requires the Cloudflare Access headers and a bearer token.
 - A fake transcriber (`tests/fake_generator.py`) stands in for Whisper.
 - The real `validate_sidecar.py` and `publish_sidecar.abs_copy` are used.

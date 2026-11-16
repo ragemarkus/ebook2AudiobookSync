@@ -31,3 +31,4 @@ companion/data/
 companion/worker-data/
 companion/no-library/
 worker.env
+dist/
