@@ -26,3 +26,8 @@ __pycache__/
 abs_access.lua
 .env
 *.secret
+# companion runtime state and local env files
+companion/data/
+companion/worker-data/
+companion/no-library/
+worker.env

@@ -28,6 +28,7 @@ The XTEINK X4 Pro's CrossInk firmware can't run plugins.
 | `plugin/overlay/` | The changed and new plugin files: Cloudflare Access headers, read-along sidecar, and ABS sidecar fetch. |
 | `plugin/patches/` | The same changes as `git format-patch` against upstream tag `v0.6.13` (commit `9a59606`). |
 | `plugin/tests/` | Lua tests (`dev/` in the plugin). Run them with `build_plugin.py --test` (needs `pip install lupa`). |
+| `companion/` | Always-on service for the XPS (Docker): watches ABS, generates missing sidecars (CPU, or an optional G14 GPU worker), validates them and writes them into the ABS item folder. Has a web UI and JSON API. See `companion/README.md`. |
 | `fallback/readalong_build.py` | Comparison route: writes the alignment as an EPUB3 Media Overlay book with the audio embedded. |
 
 ## Storing the timing file: recommended route
@@ -91,6 +92,15 @@ Or use Docker Desktop with WSL2: `cd sidecar && docker compose build readalong-g
    - Settings: **Highlight words** gives a moving word box. Turn on **Group short cues** if e-ink flashes.
    - To seek the audio, select text and choose **Play aligned from here**.
 
+## Automatic: the companion service
+Rather than running the steps above per book, run `companion/` on the always-on XPS:
+- It scans ABS every few hours and queues each book that has audio and an EPUB but no `*.readalong.json`.
+- It generates the sidecar, validates it, and drops it into the item folder.
+- It keeps state and retries in SQLite and shows everything at `http://<xps-host>:8765`.
+- It can hand the heavy work to the G14 (`WORKER_MODE=both` plus `docker-compose.worker.yml`).
+
+Setup is in [`companion/README.md`](companion/README.md).
+
 ## Timing (per hour of audio)
 | machine | model | estimate |
 |---|---|---|
@@ -106,6 +116,7 @@ Prototype accuracy (Gift of the Magi, 13 min, small.en on CPU):
 ## Tests
 - `python plugin/build_plugin.py --test`: Lua, sidecar parsing, highlight ranges, ABS fetch and matching.
 - `python sidecar/tests/test_publish_sidecar.py`: ABS copy, scan and Grimmory upload against a fake server.
+- `python -m unittest discover -s companion/tests -v`: the companion service, against a fake ABS and a fake transcriber.
 
 ## Licence and attribution
 - `plugin/` is derived from [stradichenko/audiobook.koplugin](https://github.com/stradichenko/audiobook.koplugin), tag `v0.6.13` (commit `9a59606baddc67d31ed801fe20c942c425aed396`), © its authors, licensed under the **GNU AGPL-3.0**.

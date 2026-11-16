@@ -1,0 +1,32 @@
+# Read-along companion on the Dell XPS 13 (CPU).  From this folder:
+#   cp env.example .env   # then edit it
+#   mkdir -p data && docker compose up -d --build
+# Web UI: http://<xps-host>:8765  (LAN only: don't publish this port through the tunnel)
+services:
+  readalong-companion:
+    build:
+      context: ..
+      dockerfile: companion/Dockerfile
+    image: readalong-companion:cpu
+    container_name: readalong-companion
+    restart: unless-stopped
+    env_file: .env
+    # same owner as the ABS library files so the sidecar can be written into item folders
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${COMPANION_PORT:-8765}:8765"
+    volumes:
+      - ./data:/data                                   # state.db, sidecars/, work/, models/
+      # The folder ABS has as its library, mounted at /library. ABS_PATH_MAP in .env
+      # translates ABS's own path (e.g. /audiobooks) to /library.
+      - ${ABS_LIBRARY_HOST_PATH:-./no-library}:/library
+    # 2 cores / 4 threads: leave room for the XPS's other containers
+    cpus: ${COMPANION_CPUS:-3}
+    mem_limit: 6g
+    # If ABS runs in Docker on this machine too, you can join its network and use
+    # ABS_URL=http://audiobookshelf:80 instead of the host address:
+    # networks: [abs]
+# networks:
+#   abs:
+#     external: true
+#     name: <abs-network>
